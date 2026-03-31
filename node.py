@@ -173,7 +173,7 @@ def create_app(chain: Blockchain) -> Flask:
             return jsonify({"error": "failed to create transaction"}), 400
 
         chain.submit_tx(tx)
-        pf(f"{C.DIM}  TX: {sender} -> {receiver} {amount:.2f} KURA ({tx.tx_hash[:12]}...){C.RESET}")
+        pf(f"{C.DIM}  TX: {sender} -> {receiver} {amount:.2f} PROX ({tx.tx_hash[:12]}...){C.RESET}")
         return jsonify({"tx_hash": tx.tx_hash, "status": "pending"})
 
     @app.route("/balance/<name>")
@@ -321,7 +321,7 @@ def main():
     parser.add_argument("--miss-prob", type=float, default=0.37,
                         help="Fraction of honest validators with partial observation")
     parser.add_argument("--init-accounts", nargs="*", default=["Alice", "Bob"],
-                        help="Pre-fund these accounts with 1000 KURA each")
+                        help="Pre-fund these accounts with 1000 PROX each")
     parser.add_argument("--init-balance", type=float, default=1000.0)
     parser.add_argument("--tree", action="store_true",
                         help="Use tree-structured consensus instead of flat")

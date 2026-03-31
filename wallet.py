@@ -125,7 +125,7 @@ def main():
     # Show welcome
     bal = client.balance()
     balance = bal.get("balance", 0.0)
-    print(f"\n{C.BOLD}Welcome {args.name}!{C.RESET} Balance: {C.GREEN}{balance:.2f} KURA{C.RESET}")
+    print(f"\n{C.BOLD}Welcome {args.name}!{C.RESET} Balance: {C.GREEN}{balance:.2f} PROX{C.RESET}")
     print(f"Connected to {args.node}")
     print(f"Type 'help' for commands.\n")
 
@@ -159,7 +159,7 @@ def main():
                 bal = resp["balance"]
                 pending = resp.get("pending_out", 0)
                 avail = resp.get("available", bal)
-                print(f"{C.GREEN}{bal:.2f} KURA{C.RESET}", end="")
+                print(f"{C.GREEN}{bal:.2f} PROX{C.RESET}", end="")
                 if pending > 0:
                     print(f" ({C.YELLOW}{avail:.2f} after pending txs{C.RESET})", end="")
                 print()
@@ -212,7 +212,7 @@ def main():
                 h = resp.get("height", 0)
                 mp = resp.get("mempool_size", 0)
                 supply = resp.get("supply", 0)
-                print(f"Chain height: {h} | Mempool: {mp} txs | Supply: {supply:.2f} KURA")
+                print(f"Chain height: {h} | Mempool: {mp} txs | Supply: {supply:.2f} PROX")
                 last = resp.get("last_consensus")
                 if last:
                     fp = "fast path" if last.get("fast_path") else "full protocol"
