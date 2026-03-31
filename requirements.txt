@@ -1,0 +1,5 @@
+py-ecc>=7.0.0
+bitarray>=2.8.0
+matplotlib>=3.8.0
+numpy>=1.26.0
+flask>=3.0.0
