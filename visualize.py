@@ -9,6 +9,7 @@ Fig 4: Fast path probability heatmap
 Fig 5: Tree level breakdown (where messages go)
 Fig 6: BLS aggregation bottleneck (projected blst numbers)
 Fig 7: Latency model (network RTT + BLS processing)
+Fig 8: Cross-shard verification overhead (digest vs 2PC vs receipts)
 """
 
 import hashlib, math, os, time
@@ -608,6 +609,74 @@ def figure7():
 
 
 # =====================================================================
+# Figure 8: Cross-shard verification overhead
+# =====================================================================
+
+def figure8():
+    """Cross-shard message overhead: digest comparison vs 2PC vs receipts."""
+    print("Figure 8: Cross-shard verification overhead...")
+
+    from cross_shard_sim import two_phase_commit_cost, receipt_cost, digest_cost
+
+    n_txs = 1000
+    n_val = 100
+    prop_rates = np.arange(0.50, 1.005, 0.01)
+
+    tpc = two_phase_commit_cost(n_txs, n_val)
+    rec = receipt_cost(n_txs, n_val)
+
+    digest_msgs = []
+    digest_bytes = []
+    for pr in prop_rates:
+        d = digest_cost(n_txs, float(pr), n_val)
+        digest_msgs.append(d["msgs"])
+        digest_bytes.append(d["bytes"])
+
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(13, 5.5))
+
+    # Left: messages vs propagation rate
+    ax1.axhline(y=tpc["msgs"], color=RED, lw=2, ls="--", label="2PC")
+    ax1.axhline(y=rec["msgs"], color=ORANGE, lw=2, ls="--", label="Receipt (NEAR)")
+    ax1.plot(prop_rates * 100, digest_msgs, "-", color=GREEN, lw=2.5, label="Digest (Proxima)")
+    ax1.set_xlabel("Pre-deadline Propagation Rate (%)")
+    ax1.set_ylabel("Total Messages")
+    ax1.set_title("Cross-Shard Messages (1000 txs)", fontweight="bold")
+    ax1.legend(fontsize=10)
+    ax1.set_xlim(50, 100)
+
+    # Mark the 95% operating point
+    d95 = digest_cost(n_txs, 0.95, n_val)
+    ax1.plot(95, d95["msgs"], "D", color=GREEN, ms=10, zorder=5)
+    ax1.annotate(f"{d95['msgs']:,} msgs\n({(1-d95['msgs']/tpc['msgs'])*100:.0f}% vs 2PC)",
+                 xy=(95, d95["msgs"]), xytext=(-80, 30), textcoords="offset points",
+                 fontsize=9, fontweight="bold", color=GREEN,
+                 arrowprops=dict(arrowstyle="->", color=GREEN))
+
+    # Right: bandwidth vs propagation rate
+    ax2.axhline(y=tpc["bytes"]/1024, color=RED, lw=2, ls="--", label="2PC")
+    ax2.axhline(y=rec["bytes"]/1024, color=ORANGE, lw=2, ls="--", label="Receipt (NEAR)")
+    ax2.plot(prop_rates * 100, [b/1024 for b in digest_bytes], "-",
+             color=GREEN, lw=2.5, label="Digest (Proxima)")
+    ax2.set_xlabel("Pre-deadline Propagation Rate (%)")
+    ax2.set_ylabel("Total Bandwidth (KB)")
+    ax2.set_title("Cross-Shard Bandwidth (1000 txs)", fontweight="bold")
+    ax2.legend(fontsize=10)
+    ax2.set_xlim(50, 100)
+
+    d95_kb = d95["bytes"] / 1024
+    ax2.plot(95, d95_kb, "D", color=GREEN, ms=10, zorder=5)
+    ax2.annotate(f"{d95_kb:.0f} KB",
+                 xy=(95, d95_kb), xytext=(-60, 25), textcoords="offset points",
+                 fontsize=9, fontweight="bold", color=GREEN,
+                 arrowprops=dict(arrowstyle="->", color=GREEN))
+
+    fig.suptitle("Cross-Shard Overhead: Digest Comparison vs 2PC vs Receipts",
+                 fontsize=14, fontweight="bold", y=1.02)
+    fig.tight_layout()
+    save(fig, "fig8_cross_shard.png")
+
+
+# =====================================================================
 
 def main():
     t0 = time.time()
@@ -619,6 +688,7 @@ def main():
     figure5()
     figure6()
     figure7()
+    figure8()
     print(f"\nDone in {time.time()-t0:.1f}s. Figures in {OUT}/")
 
 
