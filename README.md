@@ -1,6 +1,6 @@
 # Proxima: Distance-Preserving Digests for BFT Consensus
 
-MEng capstone project, University of Connecticut.
+MEng capstone project, University of Connecticut. Advisor: Dr. Joe Johnson.
 
 Every BFT consensus protocol uses collision-resistant hashes to compare validator state. Collision resistance destroys distance: validators agreeing on 19 of 20 transactions produce unrelated hashes, indistinguishable from validators sharing nothing. This forces three constraints across the BFT literature: validators must synchronize state before voting, agreement quality cannot be measured until votes are counted, and hierarchical committees must be large enough for independent BFT.
 
@@ -18,10 +18,12 @@ blockchain.py          Core protocol: digests, bloom filters, BLS, consensus
                         - tree_consensus(): hierarchical tree protocol
                         - Blockchain, State, Block, Transaction classes
                         - calibrate_threshold(): Monte Carlo threshold tuning
+                        - MessageCounter: per-message-type accounting
 
 hotstuff.py            HotStuff + PBFT simulation for fair comparison
                         - hotstuff_consensus(): 3-phase leader-based BFT
                         - pbft_consensus(): O(N^2) classic PBFT counts
+                        - Same MessageCounter as blockchain.py for like-for-like
 
 node.py                HTTP server with background miner threads
                         - Flask API on port 8545
@@ -50,23 +52,16 @@ cross_shard_sim.py     Cross-shard verification comparison
                         - Saves cross_shard_results.json
 
 visualize.py           Publication figures (8 PNGs)
-                        - Fig 1: Distance-preserving vs distance-destroying
-                        - Fig 2: Scale comparison (Tree + Flat + HotStuff + PBFT)
-                        - Fig 3: Byzantine sweep
-                        - Fig 4: Fast path probability heatmap
-                        - Fig 5: Tree level breakdown
-                        - Fig 6: BLS aggregation bottleneck
-                        - Fig 7: Latency model (network + BLS processing)
-                        - Fig 8: Cross-shard verification overhead
+                        - Reads cached JSON from benchmark_bls.py + cross_shard_sim.py
 
 test_byzantine.py      Byzantine strategy verification
-                        - Tests all 5 strategies with 20 txs
-                        - Shows threshold behavior with small blocks
-
+                        - Tests all 5 strategies (drop_half, random_vector,
+                          replace_one_tx, mimic_honest, coalition)
 
 requirements.txt       pip dependencies
-.gitignore             pycache, figures, .env
 ```
+
+Roughly 2,000 lines of Python total.
 
 ## Setup
 
@@ -89,6 +84,19 @@ Dependencies:
 - **numpy**: Vector math, distance computation
 - **matplotlib**: Figure generation
 - **flask**: HTTP server
+
+## Reproducing the Paper
+
+To regenerate every benchmark and figure from scratch:
+
+```bash
+pip install -r requirements.txt
+python benchmark_bls.py        # generates benchmark_results.json
+python cross_shard_sim.py      # generates cross_shard_results.json
+python visualize.py            # generates figures/fig1..fig8
+```
+
+Total runtime: roughly 3 minutes on a laptop. The figures land in `figures/`.
 
 ## Interactive Demo
 
@@ -228,7 +236,9 @@ Measures the BLS aggregation bottleneck and projects production blst numbers.
 python benchmark_bls.py
 ```
 
-Key output: at N=100K, flat BLS aggregation takes 3.5s on one CPU. Tree critical path takes 10ms. Saves `benchmark_results.json`.
+At N=100K with single-core BLS: flat aggregation takes 3,960ms on the critical path. Tree aggregation takes 9.9ms (each leaf processes ~7 signatures, internal nodes process ~10 child aggregates). Multi-core BLS (16-way) brings flat down to ~220ms and HotStuff's three rounds down to ~940ms. The tree gains nothing from extra cores because each leaf already processes under a millisecond of BLS work, but it retains its critical-path advantage at any core count.
+
+Saves `benchmark_results.json`.
 
 ### Cross-shard simulation
 
@@ -238,7 +248,7 @@ Analytical comparison of cross-shard verification methods.
 python cross_shard_sim.py
 ```
 
-Compares 2PC, NEAR-style receipts, and digest comparison across propagation rates. Key output: at 95% propagation, digest comparison uses 99% fewer messages than 2PC. Saves `cross_shard_results.json`.
+Compares 2PC, NEAR-style receipts, and digest comparison across propagation rates. At 95% propagation: digest comparison uses 5,052 messages versus 404,000 for 2PC and 101,000 for receipts (99% and 95% reduction respectively). Saves `cross_shard_results.json`.
 
 ### Byzantine strategy test
 
@@ -256,7 +266,7 @@ python test_byzantine.py
 | replace_one_tx | No | ~1.5 | Yes (invalid BLS commit) |
 | mimic_honest | No | ~1.2 | Yes (invalid BLS commit) |
 
-Phase 1 catches large deviations. Phase 2 catches small ones.
+Phase 1 catches large deviations. Phase 2 catches small ones (and any adversarial transaction crafted to land within the threshold; see Section 8.4 of the paper).
 
 ## Publication Figures
 
@@ -264,20 +274,20 @@ Phase 1 catches large deviations. Phase 2 catches small ones.
 python visualize.py
 ```
 
-Generates 8 PNGs in `figures/`. Takes 2-3 minutes (figure 3 is the slowest).
+Generates 8 PNGs in `figures/`. Takes 2-3 minutes.
 
 | Figure | What it shows |
 |---|---|
 | fig1 | SHA-256 Hamming distance (flat) vs 8D vector distance (proportional) |
-| fig2 | Messages + bandwidth scaling: Tree, Flat, HotStuff, PBFT (N=50 to 10K) |
-| fig3 | Byzantine sweep: success rate, messages, bandwidth vs Byzantine fraction |
+| fig2 | Two-phase Proxima protocol vs HotStuff three-round structure |
+| fig3 | Cross-shard overhead: digest vs 2PC vs receipts across propagation rates |
 | fig4 | Fast path probability heatmap (miss rate x Byzantine fraction) |
-| fig5 | Tree level breakdown: where messages live (leaves dominate) |
-| fig6 | BLS bottleneck: processing time flat vs tree vs HotStuff (blst projected) |
-| fig7 | Latency model: network RTT + BLS processing, breakdown at N=100K |
-| fig8 | Cross-shard overhead: digest vs 2PC vs receipts across propagation rates |
+| fig5 | Messages + bandwidth scaling: Tree, Flat, HotStuff, PBFT |
+| fig6 | Tree level breakdown: where messages live (leaves dominate) |
+| fig7 | BLS bottleneck: processing time flat vs tree vs HotStuff (blst projected) |
+| fig8 | Latency model: network RTT + BLS processing, breakdown at N=100K |
 
-Figures 6-7 use projected blst constants, not measured py-ecc times. Figure 8 uses analytical message counts from `cross_shard_sim.py`.
+Figures 7 and 8 use projected blst constants, not measured py-ecc times. Figure 3 uses analytical message counts from `cross_shard_sim.py`.
 
 ## API Reference
 
@@ -325,23 +335,47 @@ Same two phases, routed through a tree of branching factor B (default 10).
 - Phase 2: BLS commits route up through tree, each node aggregates (BLS is associative)
 - Finality proof broadcasts back down to all validators
 
-Key insight: leaves never "fail." A leaf with 5 Byzantine out of 10 excludes the 5 and reports the mean of the remaining 5. No group vote needed.
+Key insight: leaves never "fail." A leaf with 5 Byzantine out of 10 excludes the 5 and reports the mean of the remaining 5. No group vote needed. A leaf entirely Byzantine produces a fabricated summary that the root's distance check still rejects.
 
-### Key Numbers (N=100, 30% Byzantine, 37% partial observation)
+## Key Numbers
 
-| Protocol | Messages | Bandwidth |
+### Message complexity (30% Byzantine, 37% partial observation)
+
+| Validators | Proxima Tree | Proxima Flat | HotStuff | PBFT |
+|---|---|---|---|---|
+| 1,000 | 2,990 | 3,348 | 6,518 | 1,999,000 |
+| 10,000 | 30,042 | 33,600 | 65,180 | 199,990,000 |
+| 100,000 | 300,245 | 335,803 | 651,800 | ~20 billion |
+
+Proxima Tree is 2.2x fewer messages than HotStuff. PBFT is included for context (O(N^2)).
+
+### Projected finality latency at N=100,000
+
+|  | Proxima Tree | Proxima Flat | HotStuff |
+|---|---|---|---|
+| BLS processing (1 core) | 9.9 ms | 3,960 ms | 17,595 ms |
+| Network RTT (model) | 892 ms | 600 ms | 800 ms |
+| Total finality (1 core) | 902 ms | 4,561 ms | 18,395 ms |
+| BLS only (16 cores) | ~10 ms | ~220 ms | ~940 ms |
+
+Multi-core BLS narrows the gap considerably but does not eliminate it. The tree retains a critical-path BLS advantage at any core count because each leaf only aggregates ~7 signatures (already under a millisecond). The structural advantages (message complexity, smaller hierarchical groups, fast-path finality) are core-count-independent.
+
+### Cross-shard overhead (1000 cross-shard txs, 100 validators per shard)
+
+| Method | Messages | Bandwidth |
 |---|---|---|
-| Proxima Flat | ~336 | ~31 KB |
-| Proxima Tree | ~336 | ~31 KB |
-| HotStuff | ~650 | ~100 KB |
-| PBFT | ~19,900 | ~2,488 KB |
+| 2PC | 404,000 | 37,750 KB |
+| Receipt (NEAR) | 101,000 | 12,625 KB |
+| Digest (95% propagation) | 5,052 | 987 KB |
 
-At N=1000: Tree 2,990 msgs, Flat 3,348 msgs, HotStuff 6,518 msgs. Tree advantage grows with N.
+99% reduction versus 2PC, 95% versus receipts. Cost scales with conflicts (5%) rather than with total cross-shard volume.
 
-### Security
+## Security
 
 **Safety (proved):** fewer than N/3 Byzantine cannot cause conflicting finalization. Phase 1 clustering cannot affect safety (wrong inclusion = invalid BLS sig, wrong exclusion = reduced liveness). Tree routing cannot affect safety (BLS aggregation is associative, Byzantine nodes can suppress but not forge).
 
-**Liveness (bounded):** probability of excluding >N/3 honest validators is exp(-0.00185N * 179), negligible for N > 10. Rotating aggregator under partial synchrony ensures progress after GST.
+**Liveness (bounded):** by Hoeffding's inequality, the probability that more than N/3 honest validators are excluded is at most exp(-0.22N), below 10^-9 at N=100 and below 10^-95 at N=1000. Rotating aggregator under partial synchrony ensures progress after GST.
+
+**Adversarial transaction construction:** Phase 1 distance filtering provides no cryptographic security. A Byzantine adversary can craft a transaction set whose digest lands within the threshold using k-list search (~12 bits of work at our parameters). This is fine: Phase 1 is a filter, not a safety mechanism. Phase 2 still requires a valid BLS signature on the honest block hash, which the Byzantine cannot produce. The cost of a successful Phase 1 spoof is one wasted Phase 2 round, indistinguishable from any other Byzantine signature withholding.
 
 **Byzantine tolerance:** 100% success 0-33%, 0% at 35%+, matching the standard BFT bound.

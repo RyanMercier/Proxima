@@ -6,3 +6,8 @@ figures/
 *.egg-info/
 dist/
 build/
+
+# Generated files
+benchmark_results.json
+cross_shard_results.json
+
