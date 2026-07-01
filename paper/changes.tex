@@ -1,0 +1,157 @@
+\documentclass[10pt]{article}
+\usepackage[margin=2.2cm]{geometry}
+\usepackage{microtype}
+\usepackage{url}
+\usepackage{hyperref}
+\hypersetup{hidelinks}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{5pt}
+
+\title{\vspace{-1.2cm}Summary of Changes\\[2pt]
+\large Distance-Preserving Digests: A Primitive for BFT Consensus (BLOCKCHAIN'26 camera-ready)}
+\author{Ryan Mercier}
+\date{}
+
+\begin{document}
+\maketitle
+\vspace{-1.1cm}
+
+References give the location in the submitted IEEEtran version first and in
+this Springer camera-ready second; condensation to the 10-page limit turned
+several IEEE subsections into run-in paragraphs inside renumbered sections.
+
+\section*{Reviewer 1}
+
+\textbf{1. No heading directly followed by another heading.} Every section
+now opens with a substantive lead-in paragraph stating what problem the
+section addresses and how its parts connect. Lead-ins were added at the
+former junctions: the primitive (was Sect.~III, now Sect.~4), the consensus
+protocol (was Sect.~IV, now Sect.~5), cross-shard consistency (was
+Sect.~V, now Sect.~6), the evaluation (was Sect.~VII, now Sect.~7), and the
+security analysis (was Sect.~VIII, now Sect.~8).
+
+\textbf{2. Related work should follow the introduction.} Related work moved
+from the back (was Sect.~IX) to directly after the introduction (now
+Sect.~2). The redundancy this exposed with the introduction (LSH novelty,
+Ethereum committee mechanics, cross-shard coordination detail) was merged
+into the relocated section; the trims are logged in \texttt{CUTS.md} in the
+repository.
+
+\textbf{3. Add implementation details.} An implementation paragraph now
+closes the evaluation (was Sect.~X, now the ``Implementation'' paragraph of
+Sect.~7): digest computation cost and layout (one SHA-512 plus eight
+modular reductions per transaction, vectorized sums, 64 bytes on the wire),
+the two interchangeable BLS code paths (real BLS12-381 via py-ecc in the
+demo, hash-based mocks preserving the 96-byte signature and 48-byte
+public-key wire sizes in benchmarks) with their cross-validation
+(identical per-block message totals on the small-$N$ demo under both), and
+the aggregation-side optimizations in the codebase (single-push bloom-diff
+sync, direct aggregation of speculative Phase~1 commitments into the
+fast-path certificate, per-leaf splitting of tree aggregation). Only what
+exists in the cited repository is described.
+
+\section*{Reviewer 2}
+
+\textbf{1. Abstract: the 8-dimensional digest space needs background.} The
+abstract now explains the object before using it: each transaction hashes
+to a point in an 8-dimensional space, a validator's digest is the sum of
+its transactions' points, and the Euclidean distance between two digests is
+therefore proportional to the number of differing transactions. The
+abstract stays within 150--250 words.
+
+\textbf{2. Motivate the static adversary model.} The introduction's closing
+paragraph now states that static corruption is the standard first-analysis
+setting for this protocol class, the model in which the classical safety
+arguments for PBFT, HotStuff, and Tendermint are stated, and that it
+isolates the primitive's contribution from adaptive corruption; adaptive
+adversaries are declared out of scope with a pointer to the limitations
+discussion (now Sect.~9).
+
+\textbf{3. Sect.~III.D numbers must be derivable.} The liveness bound (now
+the ``Threshold calibration and liveness bound'' paragraph of Sect.~4)
+derives every constant in prose: $k_{\max}{=}2$ is the partial-observation
+model the calibration samples; the sampled 99th percentile ${\approx}4.1$
+times the $1.2$ margin gives $\tau \approx 4.9$; the conditional exceedance
+$0.005$ is measured over the same sample; multiplying by $p_{\mathrm{miss}}
+= 0.37$ gives $p = 0.00185$; Hoeffding with $t = 1/3 - p \approx 0.33$
+(so $2t^2 \approx 0.22$) yields $\exp(-0.22N)$, evaluated as $\exp(-22)
+\approx 3{\times}10^{-10} < 10^{-9}$ at $N{=}100$ and $\exp(-220) <
+10^{-95}$ at $N{=}1000$.
+
+\textbf{4. Overview paragraph for the protocol section.} Sect.~5 (was
+Sect.~IV) opens by stating what each phase does, that the phases collapse
+into one round trip when enough validators already hold the block, and why
+the signature phase can be accelerated but never skipped.
+
+\textbf{5. Overview paragraph for the evaluation section.} Sect.~7 (was
+Sect.~VII) opens with the three questions the evaluation answers (message
+load at scale, the BLS bottleneck, the cost to Byzantine tolerance) and the
+measurement discipline (a counter on every simulated send, identical byte
+constants across protocols).
+
+\textbf{6. Informal phrasing in the cross-shard section.} In Sect.~6 (was
+Sect.~V): ``Lower latency, but receipts scale with transaction volume''
+became ``\ldots achieves lower latency than two-phase commit at the price
+of receipt volume that grows linearly with cross-shard transaction
+volume''; ``tells you identical or not-identical'' became ``hash-based
+verification indicates only whether two states are identical, revealing
+nothing about the magnitude of divergence.'' The section's remaining
+fragments (the table lead-in, the multi-shard enumeration) were rewritten
+as complete sentences.
+
+\textbf{7. HotStuff referenced without introduction.} At first mention
+(Sect.~1) HotStuff is now described self-contained: a leader-based BFT
+protocol whose rotating leader drives each block through three voting
+rounds, collecting each round's votes into a threshold-signature quorum
+certificate proving $2N/3$ support. Later references build on this; nothing
+beyond what the comparisons use was added.
+
+\section*{Additional changes}
+
+\textbf{(a) Template.} Reformatted from IEEEtran two-column to the Springer
+template required by the congress (\texttt{llncs} class, \texttt{splncs04}
+bibliography, keywords after the abstract, no page numbers), renumbering
+all sections, figures, and tables.
+
+\textbf{(b) Author-identified fast-path correction.} The submitted version
+issued the fast-path certificate from Phase~1 digest agreement alone
+(near-zero cluster variance), backed by no signatures, inconsistent with
+the paper's own analysis (Theorem~1's premise is $2N/3$ signed commitments;
+Sect.~VIII.D states Phase~1 contributes no cryptographic security). The
+mechanism is repaired, not softened: Phase~1 messages now carry a BLS
+commitment on $(\mathit{height}, H(B_{\mathrm{prop}}))$, attached iff the
+validator's local state matches the proposal ($64{+}25{+}96$-byte payload
+from matching validators), and the fast path triggers only when the
+aggregator collects ${\ge}2N/3$ valid commitments on one hash in round one,
+aggregating them into a certificate byte-identical to the Phase~2 object
+(96-byte aggregate plus $N/8$-byte bitmap). Single-round finality is thus
+covered by Theorem~1 verbatim, and an aggregator can at most withhold a
+certificate (liveness), as noted after Corollary~1. On a miss, the round
+falls back to full Phase~2 collection exactly as submitted; Phase~1
+commitments may be reused there, a saving the evaluation conservatively
+does not model. The fast path applies to the flat protocol; carrying
+speculative commitments up the tree is deferred.
+$(1-p_{\mathrm{miss}})^N$ is now labelled a lower bound on engagement
+(matching all honest validators, where only $2N/3$ commitments are
+required). The mechanism follows the speculative lineage of Zyzzyva (Kotla
+et al., SOSP 2007) and SBFT (Gueta et al., DSN 2019), both now cited. The
+Byzantine-sweep figure (was Fig.~9, now Fig.~2) was regenerated by
+re-running the repository's figure script so its bandwidth panel reflects
+the 96-byte Phase~1 commitment; a pinned-clock comparison verified that
+success rates, message counts, and the other protocols' bandwidth are
+bit-identical, and at $p_{\mathrm{miss}}{=}0.37$ the fast path does not
+engage, so all other reported numbers are unchanged. The repository
+implementation was updated to match.
+
+\textbf{(c) Condensation.} The mechanical Springer conversion ran to 17
+pages before the requested additions, so the camera-ready is condensed to
+the 10-page limit: secondary derivations became one-line results with
+pointers to the extended version (technical report at
+\url{https://github.com/RyanMercier/Proxima}), figures whose plotted values
+are fully stated in the retained tables and prose were removed, the
+messages and latency tables were merged, and several subsections became
+run-in paragraphs. No reviewed number, table value, or plotted datum was
+changed; no technical content beyond (b) was added. The full cut log is
+\texttt{CUTS.md}.
+
+\end{document}
