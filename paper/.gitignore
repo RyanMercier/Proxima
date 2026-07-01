@@ -5,3 +5,5 @@
 *.blg
 *.toc
 *.synctex.gz
+pg-*.png
+montage.png
