@@ -32,7 +32,7 @@
 
 % ===========================================================================
 \begin{abstract}
-Every BFT consensus protocol uses collision-resistant hashes to compare validator state. Collision resistance destroys distance: two validators agreeing on 19 of 20 transactions produce unrelated hashes, indistinguishable from validators sharing nothing. This forces three design constraints across the BFT literature: validators must synchronize state before voting, agreement quality cannot be measured until votes are counted, and hierarchical committees must be large enough for independent BFT, limiting tree depth. This paper introduces distance-preserving transaction digests, a primitive that replaces collision-resistant hashes with commutative vector sums in 8-dimensional space. The primitive has three properties hashes lack: distance is proportional to disagreement, weighted means are exact, and set differences are identifiable via bloom filter diff. We demonstrate three applications: a two-phase BFT protocol (Proxima) that achieves single-round finality when validators agree; tree-structured consensus with groups of 10 validators (vs 128 in Ethereum), enabled because distance filtering replaces per-group BFT; and cross-shard consistency verification at 128 bytes per shard pair, replacing the per-transaction coordination of two-phase commit. Safety is proved: fewer than $N/3$ Byzantine validators cannot cause conflicting finalization, independent of Phase 1 clustering or tree topology. At $N{=}100{,}000$, Proxima Tree uses $2.2\times$ fewer messages than HotStuff (a structural property unaffected by parallelism). Single-core finality is $\sim\!0.9$s vs $\sim\!18$s for HotStuff; multi-core BLS narrows but does not eliminate this gap.
+Every BFT consensus protocol uses collision-resistant hashes to compare validator state. Collision resistance destroys distance: two validators agreeing on 19 of 20 transactions produce unrelated hashes, indistinguishable from validators sharing nothing. This forces three design constraints across the BFT literature: validators must synchronize state before voting, agreement quality cannot be measured until votes are counted, and hierarchical committees must be large enough for independent BFT, limiting tree depth. This paper introduces distance-preserving transaction digests, a primitive that replaces the collision-resistant hash with a commutative vector sum: each transaction hashes to a point in an 8-dimensional space, and a validator's digest is the sum of the points for the transactions it holds, so the Euclidean distance between two digests is proportional to the number of transactions on which the two validators differ. Beyond proportional distance, the primitive has two further properties hashes lack: weighted means of digests summarize a group exactly, and set differences are identifiable via bloom filter diff. We demonstrate three applications: a two-phase BFT protocol (Proxima) that achieves single-round finality when validators agree; tree-structured consensus with groups of 10 validators (vs 128 in Ethereum), enabled because distance filtering replaces per-group BFT; and cross-shard consistency verification at 128 bytes per shard pair, replacing the per-transaction coordination of two-phase commit. Safety is proved: fewer than $N/3$ Byzantine validators cannot cause conflicting finalization, independent of Phase 1 clustering or tree topology. At $N{=}100{,}000$, Proxima Tree uses $2.2\times$ fewer messages than HotStuff (a structural property unaffected by parallelism). Single-core finality is $\sim\!0.9$s vs $\sim\!18$s for HotStuff; multi-core BLS narrows but does not eliminate this gap.
 
 \keywords{Byzantine fault tolerance \and blockchain \and consensus protocols \and locality-sensitive hashing \and sharding}
 \end{abstract}
@@ -42,14 +42,31 @@ Every BFT consensus protocol uses collision-resistant hashes to compare validato
 
 BFT consensus has been built on collision-resistant hashing since PBFT~\cite{castro1999pbft}. Collision resistance is the right property for preventing forgery, but the wrong property for measuring agreement. When two validators compute SHA-256 of their transaction sets and the hashes differ, the protocol learns exactly one bit of information: not identical. It cannot tell whether they differ on one transaction or half the transactions. It cannot measure how close they are to agreement. It cannot summarize a group of validators as a single compact value.
 
-These limitations are baked into every protocol that uses hashes for state comparison. HotStuff~\cite{yin2019hotstuff} runs three voting rounds even when every validator agrees perfectly, because it has no way to detect unanimous agreement until all three rounds complete. Ethereum 2.0~\cite{eth2spec} requires committees of 128 validators because each committee must independently reach 2/3 consensus, and small committees fail when random assignment concentrates Byzantine validators. Cross-shard transactions require multi-round coordination (two-phase commit or receipt chains) because hashes cannot verify partial overlap between shard states.
+These limitations are baked into every protocol that uses hashes for state comparison. Consider HotStuff~\cite{yin2019hotstuff}, the leader-based BFT protocol underlying several production systems: leadership rotates among the validators, and in each view the leader drives the block through three voting rounds, collecting the votes of each round into a threshold-signature quorum certificate that proves $2N/3$ support. Because those certificates are built from collision-resistant hashes, HotStuff runs all three rounds even when every validator agrees perfectly; unanimous agreement is undetectable until all votes are counted. Ethereum 2.0~\cite{eth2spec} requires committees of 128 validators because each committee must independently reach 2/3 consensus, and small committees fail when random assignment concentrates Byzantine validators. Cross-shard transactions require multi-round coordination (two-phase commit or receipt chains) because hashes cannot verify partial overlap between shard states.
 
-This paper proposes replacing collision-resistant hashes with distance-preserving digests for state comparison in BFT protocols. The primitive is simple: hash each transaction with SHA-512, split the 64-byte output into 8 segments, treat each as a coordinate, and sum across transactions. The result is a commutative vector in 8D space where Euclidean distance is proportional to transaction disagreement. The primitive is not novel in the data-structures sense (locality-sensitive hashing dates to Indyk and Motwani~\cite{indyk1998lsh}), but its application to BFT consensus is new. No work in the LSH literature applies it to Byzantine agreement, and no work in the consensus literature reaches for distance-preserving functions.
+This paper proposes replacing collision-resistant hashes with distance-preserving digests for state comparison in BFT protocols. The primitive is simple: hash each transaction with SHA-512, split the 64-byte output into 8 segments, treat each as a coordinate, and sum across transactions. The result is a commutative vector in 8D space where Euclidean distance is proportional to transaction disagreement. The primitive is not novel in the data-structures sense (locality-sensitive hashing dates to Indyk and Motwani~\cite{indyk1998lsh}), but its application to BFT consensus is, to our knowledge, new.
 
 We demonstrate that this single primitive removes all three constraints. Agreement quality is measurable in one round (enabling fast-path finality). Hierarchical groups need not reach internal BFT (enabling groups of 10 and deeper trees). Cross-shard consistency is verifiable at constant cost per shard pair. We implement these as Proxima, a working BFT blockchain, and evaluate message complexity, bandwidth, and projected latency against HotStuff, PBFT, and Ethereum's committee structure.
 
+Throughout, we analyze Proxima under a static adversary that chooses which validators to corrupt before the protocol begins. Static corruption is the standard first-analysis setting for this class of protocols: it is the model in which the classical safety arguments for PBFT, HotStuff, and Tendermint are stated, and it isolates what the new primitive contributes from the orthogonal problem of corruption that reacts to protocol state. Adaptive adversaries, which corrupt validators after observing information such as tree assignments, are out of scope for this paper; Sect.~\ref{sec:limitations} discusses what defending against them requires.
+
+% ===========================================================================
+\section{Related Work}
+\label{sec:related}
+
+\textbf{BFT Consensus.} PBFT~\cite{castro1999pbft} established practical BFT with $O(N^2)$ message complexity. HotStuff~\cite{yin2019hotstuff} reduced this to $O(N)$ using leader-based aggregation and BLS threshold signatures. Tendermint~\cite{buchman2016tendermint} provides a similar $O(N)$ BFT protocol. All use collision-resistant hashes for state comparison and require full state synchronization before voting. Proxima shares HotStuff's $O(N)$ voting complexity but adds Phase 1 distance-based pre-filtering and bloom-based synchronization. Proxima's fast path follows the speculative fast-path lineage of Zyzzyva~\cite{kotla2007zyzzyva} and SBFT~\cite{gueta2019sbft}, in which signed commitments collected optimistically finalize a request in fewer rounds whenever a large enough quorum already agrees.
+
+\textbf{Hierarchical BFT.} Kauri~\cite{kauri} applies tree aggregation to HotStuff, reducing the leader bottleneck. Kauri's tree nodes still run per-group BFT (hash-based), requiring groups large enough for Byzantine tolerance. Proxima's distance filtering removes this requirement, enabling groups of 10 vs 128 and deeper trees (5 levels vs 2--3). Ethereum 2.0~\cite{eth2spec} uses random committees of 128 with per-committee BFT attestation; Proxima achieves similar distributed aggregation with groups $12.8\times$ smaller.
+
+\textbf{DAG-Based Protocols.} Narwhal and Tusk~\cite{narwhal} decouple data availability from consensus via a DAG of validator proposals. Bullshark~\cite{bullshark} builds on Narwhal with a simpler consensus rule. These protocols solve a different problem but share the property that validators may have partial views. Digests could augment DAG protocols by measuring vertex agreement quality.
+
+\textbf{Locality-Sensitive Hashing.} LSH was introduced by Indyk and Motwani~\cite{indyk1998lsh} for approximate nearest-neighbor search. SimHash~\cite{simhash} applies it to document similarity; MinHash~\cite{minhash} to Jaccard similarity; $p$-stable LSH~\cite{pstable} to $L_p$ distances. Our digest is a simple LSH scheme applied to transaction sets. No work in the LSH literature applies it to Byzantine agreement, and no work in the consensus literature reaches for distance-preserving functions.
+
+\textbf{Sharding.} Ethereum abandoned execution sharding in favor of data-availability sharding (Danksharding~\cite{danksharding}). NEAR's Nightshade~\cite{nightshade} uses receipt-based communication. Shardeum uses an address-range approach with atomic cross-shard composability. Digest-based verification offers a complementary approach: constant-cost verification per shard pair with conflict resolution only for divergent transactions.
+
 % ===========================================================================
 \section{System Model}
+\label{sec:model}
 
 We consider a system of $N$ validators, of which at most $f < N/3$ are Byzantine. Byzantine validators may behave arbitrarily. Honest validators follow the protocol.
 
@@ -67,6 +84,9 @@ We consider a system of $N$ validators, of which at most $f < N/3$ are Byzantine
 
 % ===========================================================================
 \section{The Primitive: Distance-Preserving Digests}
+\label{sec:primitive}
+
+The digest must do two jobs at once: stay as cheap to compute and transmit as an ordinary hash, and turn set disagreement into measurable geometry. We first give the construction, then the three properties that the rest of the paper builds on, and finally the calibration procedure and liveness analysis that make a distance threshold usable when some of the parties choosing their digests are adversarial.
 
 \subsection{Construction}
 
@@ -92,6 +112,7 @@ A validator's digest for a set of transactions $T$ is the commutative sum $D(T) 
 \textbf{Property 3: Set difference identification.} When two digests differ, a bloom filter~\cite{bloom1970} (25 bytes at a $1\%$ per-lookup false positive rate for $20$ transactions) lets the aggregator identify which transactions are present in one set but not the other. Bloom filters admit false positives but never false negatives, so a transaction the recipient legitimately needs is never silently dropped; we analyze the false-positive direction in Section~\ref{sec:bloom-fp}. The aggregator diffs the bloom against the full transaction set and pushes missing transactions in a single message, eliminating the request-response round-trip of traditional state synchronization.
 
 \subsection{Threshold Calibration}
+\label{sec:calibration}
 
 The distance threshold separating honest-with-partial-observation from Byzantine-with-fabricated-state is calibrated by Monte Carlo simulation. We generate 2000 samples of honest validators missing 1--2 transactions, compute the 99th percentile of the resulting distance distribution, and multiply by a safety margin of $1.2$.
 
@@ -102,33 +123,40 @@ Safety depends only on BLS signatures (Section~\ref{sec:safety}) and is independ
 
 Under the SHA-512 uniformity assumption, each transaction vector $v(tx)$ has coordinates iid Uniform$[0,1)$ with mean $1/2$ and variance $1/12$. For $k$ missing transactions, the difference $S = v(tx_1) + \cdots + v(tx_k)$ has $\mathbb{E}[\|S\|^2] = 8(k/12 + k^2/4) = 2k/3 + 2k^2$, where the $k^2$ term is the mean-offset contribution. By Jensen, $\mathbb{E}[\|S\|] \le \sqrt{\mathbb{E}[\|S\|^2]}$, giving upper bounds $1.63, 3.06, 4.47$ at $k = 1, 2, 3$. Monte Carlo over $50{,}000$ trials gives empirical means $1.61, 3.03, 4.44$, consistent with the bound.
 
-An honest validator with partial observation misses at most $k_{\max}=2$ transactions. From the Monte Carlo calibration, the conditional probability of exceeding threshold $\tau = 4.9$ is at most $0.005$. Accounting for $p_{\mathrm{miss}} = 0.37$, the unconditional per-validator exclusion probability is at most $p = 0.005 \cdot 0.37 = 0.00185$.
+An honest validator with partial observation misses at most $k_{\max}=2$ transactions; this is the partial-observation model of Sect.~\ref{sec:model}, and it is what the calibration of Sect.~\ref{sec:calibration} samples. The threshold comes from that calibration: the 99th percentile of the sampled honest distance distribution is approximately $4.1$, and the $1.2$ safety margin gives $\tau = 1.2 \cdot 4.1 \approx 4.9$. Measured over the same calibration sample, the fraction of honest draws whose distance exceeds $4.9$ is at most $0.005$; this is the exclusion probability conditioned on having an incomplete view. Exclusion requires both an incomplete view, which occurs with probability $p_{\mathrm{miss}} = 0.37$ (Sect.~\ref{sec:model}), and a conditional exceedance, so the unconditional per-validator exclusion probability is at most $p = 0.37 \cdot 0.005 = 0.00185$.
 
-Let $X$ be the number of honest validators excluded. $X$ is a sum of $N$ independent indicators bounded in $[0,1]$ with mean $\mu \le pN$. Liveness fails only if $X \ge N/3$. Since $p \ll 1/3$, applying Hoeffding's inequality with $t = 1/3 - p$:
+Let $X$ be the number of honest validators excluded. $X$ is a sum of $N$ independent indicators bounded in $[0,1]$ with mean $\mu \le pN$. Liveness fails only if $X \ge N/3$. Since $p \ll 1/3$, applying Hoeffding's inequality with $t = 1/3 - p = 1/3 - 0.00185 \approx 0.33$, so that $2t^2 \approx 0.22$:
 \begin{equation*}
   \Pr\bigl[X \ge N/3\bigr] \;\le\; \exp(-2 N t^2) \;\le\; \exp(-0.22 N).
 \end{equation*}
-This is below $10^{-9}$ at $N=100$ and below $10^{-95}$ at $N=1000$.
+At $N=100$ this is $\exp(-22) \approx 3 \times 10^{-10}$, below $10^{-9}$; at $N=1000$ it is $\exp(-220) < 10^{-95}$.
 
 % ===========================================================================
 \section{Application 1: BFT Consensus Protocol}
+\label{sec:protocol}
+
+This section applies the primitive to the consensus path itself. The resulting protocol, Proxima, runs two phases: Phase~1 measures agreement geometrically and repairs stragglers, and Phase~2 converts agreement into finality through aggregated BLS commitments; when enough validators already hold the proposed block, the two collapse into a single round trip. Sect.~\ref{sec:flat} presents the flat protocol, Sect.~\ref{sec:tree} routes the same two phases through a tree of small groups, Sect.~\ref{sec:why-phase2} explains why the signature phase can be accelerated but never skipped, and Sect.~\ref{sec:eth-committees} contrasts the resulting group structure with Ethereum's committees.
 
 \subsection{Flat Protocol}
+\label{sec:flat}
 
 \begin{figure}[!htbp]
   \centering
   \includegraphics[width=0.92\textwidth]{fig9_protocol_flow.png}
-  \caption{Two-phase Proxima protocol with optimistic fast path. Phase 1 exchanges 64-byte digests and 25-byte bloom filters; the aggregator clusters validators within threshold $\tau$ and pushes missing transactions to stragglers via bloom diff. If cluster variance is near zero the protocol finalizes in one round trip; otherwise Phase 2 collects 96-byte BLS signatures on the SHA-256 block hash, producing a 96-byte aggregate plus $N/8$-byte signer bitmap. HotStuff (right column) requires three voting rounds regardless of agreement because collision-resistant hashes cannot reveal cluster agreement before votes are counted.}
+  \caption{Two-phase Proxima protocol with speculative fast path. Phase 1 exchanges 64-byte digests and 25-byte bloom filters, plus a conditional 96-byte BLS commitment from each validator whose local state matches the proposal ($64+25+96$ bytes); the aggregator clusters validators within threshold $\tau$ and pushes missing transactions to stragglers via bloom diff. If $\ge 2N/3$ matching commitments are collected in round one, the aggregator aggregates them into the finality certificate (a 96-byte aggregate plus $N/8$-byte signer bitmap, the same object Phase 2 produces) and the block finalizes in one round trip; otherwise Phase 2 collects 96-byte BLS signatures on the SHA-256 block hash from all cluster members. HotStuff (right column) requires three voting rounds regardless of agreement because collision-resistant hashes cannot reveal cluster agreement before votes are counted.}
   \label{fig:protocol-flow}
 \end{figure}
 
-Phase 1: each validator sends its digest (64 bytes) and bloom filter (25 bytes) to the aggregator ($N$ messages). The aggregator computes the reference digest, measures each validator's Euclidean distance from the reference, and clusters validators within the threshold. The aggregator pushes missing transactions to incomplete validators via bloom diff, then broadcasts cluster assignments.
+The proposer disseminates the proposed block ahead of Phase 1; validators receive its transactions with some delay relative to the proposer (the partial-observation parameter $p_{\mathrm{miss}}$ of Sect.~\ref{sec:model}), so at digest time each validator holds a local view of the proposal that is usually, but not always, complete.
 
-If cluster variance is near zero, the aggregator issues a single-round finality certificate (fast path). No Phase 2 needed.
+Phase 1: each validator sends its digest (64 bytes) and bloom filter (25 bytes) to the aggregator ($N$ messages). A validator whose local state matches the proposal attaches to the same message a conditional BLS commitment $\sigma_i$ on $(\mathit{height}, H(B_{\mathrm{prop}}))$ (96 bytes); validators with incomplete views send digest and bloom only, so the Phase 1 payload is $64+25+96$ bytes from matching validators and $64+25$ bytes from the rest. The aggregator computes the reference digest, measures each validator's Euclidean distance from the reference, and clusters validators within the threshold. The aggregator pushes missing transactions to incomplete validators via bloom diff, then broadcasts cluster assignments.
+
+If the aggregator collects at least $2N/3$ valid commitments on the same hash within round one, it aggregates them and multicasts the finality certificate immediately (fast path). The certificate is byte-identical to the object Phase 2 produces, a 96-byte aggregate signature plus an $N/8$-byte signer bitmap, so single-round finality is covered by Theorem~\ref{thm:safety} with no modification. If the trigger is not met, the round proceeds exactly as below: clustering, bloom-diff synchronization, and Phase 2 commitment collection from all cluster members. Commitments already received in Phase 1 may be reused in Phase 2; the evaluation conservatively does not model this reuse. The fast path as described applies to the flat protocol; carrying speculative commitments up the tree requires per-group signer bitmaps and is deferred.
 
 Phase 2: cluster members send BLS-signed hash commitments (one 96-byte message each). The aggregator produces an aggregate BLS signature (96 bytes) and a signer bitmap ($N/8$ bytes). The finality proof is multicast to cluster members. Finality requires $2N/3$ matching commitments.
 
 \subsection{Tree Protocol}
+\label{sec:tree}
 
 Leaf groups do not need internal BFT. Distance filtering operates at the individual level. A group of 10 with 5 Byzantine excludes the 5 (they are far from the reference) and reports the weighted mean of the 5 honest validators. Groups never fail.
 
@@ -137,10 +165,12 @@ Phase 1 (bottom-up): validators are grouped into leaves of size $B$ (default 10)
 Phase 2 (top-down then up): the root broadcasts a commit request down the tree. Each validator that passed the filter sends a BLS commit up. Each internal node aggregates child signatures (BLS is associative). The root produces the final aggregate and broadcasts the finality proof back down.
 
 \subsection{Why Phase 2 Is Necessary}
+\label{sec:why-phase2}
 
 The distance filter cannot distinguish an honest validator missing one transaction from a Byzantine validator who replaced one transaction with fraud. Both produce distance $\sim 1.6$. Phase 2 catches the fraud: the Byzantine validator must sign the correct block hash, which it does not have.
 
 \subsection{Comparison with Ethereum Committees}
+\label{sec:eth-committees}
 
 Ethereum 2.0~\cite{eth2spec} uses random committees of 128 with per-committee 2/3 BFT attestation. With 30\% Byzantine globally, committee failure is the probability of drawing more than $G/3$ Byzantine validators. For $G{=}10$: $\Pr[\text{Bin}(10, 0.3) \ge 4] \approx 35\%$. For $G{=}128$: $\Pr[\text{Bin}(128, 0.3) \ge 43] \approx 21\%$.
 
@@ -165,20 +195,23 @@ Proxima avoids this failure mode at the per-committee level. There is no per-gro
 
 % ===========================================================================
 \section{Application 2: Cross-Shard Consistency}
+\label{sec:cross-shard}
+
+Sharded execution multiplies the state-comparison problem: shards must agree not on a single transaction set but on the overlap between many pairs of sets, and hash-based tools force them to coordinate per transaction. This section shows that digest comparison reduces that coordination to a constant-cost check per shard pair, with resolution work proportional to actual divergence rather than to cross-shard volume.
 
 \subsection{The Problem}
 
-Cross-shard transactions are the bottleneck in sharded blockchains. Two-phase commit requires 4 cross-shard messages per transaction plus intra-shard BFT consensus on each coordination message. NEAR's Nightshade~\cite{nightshade} reduces this with receipts: the source shard generates a receipt the destination includes in its next block. Lower latency, but receipts scale with transaction volume.
+Cross-shard transactions are the bottleneck in sharded blockchains. Two-phase commit requires 4 cross-shard messages per transaction plus intra-shard BFT consensus on each coordination message. NEAR's Nightshade~\cite{nightshade} reduces this with receipts: the source shard generates a receipt the destination includes in its next block. Receipts achieve lower latency than two-phase commit, but the number of receipts grows linearly with cross-shard transaction volume.
 
 \subsection{Digest-Based Verification}
 
-Digests enable a different approach. Neighboring shards exchange digests of their overlap-zone transactions once per block. If the distance is zero, both shards processed the same transactions. If nonzero, the bloom diff identifies exactly which transactions diverged, and only those require resolution.
+Digests enable a different approach. Neighboring shards exchange digests of their overlap-zone transactions once per block. If the distance is zero, both shards processed the same transactions; if it is nonzero, the bloom diff identifies exactly which transactions diverged, and only those require resolution.
 
 The cost is fixed per shard pair: 128 bytes. Conflict resolution scales with actual divergence, not total cross-shard volume.
 
 \subsection{Analytical Comparison}
 
-At 1000 cross-shard transactions per pair, 100 validators per shard, 95\% pre-deadline propagation (Table~\ref{tab:cross-shard}):
+Table~\ref{tab:cross-shard} compares the three methods at 1000 cross-shard transactions per pair, 100 validators per shard, and 95\% pre-deadline propagation.
 
 \begin{table}[!htbp]
   \caption{Cross-Shard Overhead at 1000 txs, 95\% propagation}
@@ -206,23 +239,23 @@ Digest comparison reduces messages by $99\%$ vs 2PC and $95\%$ vs receipts. The 
 
 \subsection{Multi-Shard Scaling}
 
-At 100 shards (ring topology, 100 cross-shard txs per pair, 95\% propagation): 2PC uses $4{,}040{,}000$ messages; receipt uses $1{,}010{,}000$; digest uses $50{,}502$. Digest overhead scales with conflicts (5\% of transactions), not total volume.
+At 100 shards in a ring topology, with 100 cross-shard transactions per pair and 95\% propagation, 2PC uses $4{,}040{,}000$ messages, receipts use $1{,}010{,}000$, and digest comparison uses $50{,}502$. Digest overhead scales with conflicts (5\% of transactions), not with total volume.
 
 \subsection{Why This Requires Digests}
 
-Hash-based verification tells you identical or not-identical. Digest-based verification tells you differ-by-approximately-$k$-transactions. The former requires falling back to full state exchange or per-transaction coordination. The latter allows targeted resolution of only the divergent transactions.
+Hash-based verification indicates only whether two states are identical, revealing nothing about the magnitude of divergence, so a mismatch forces a fallback to full state exchange or per-transaction coordination. Digest-based verification reports that two states differ by approximately $k$ transactions and, through the bloom diff, identifies which ones, allowing targeted resolution of only the divergent transactions.
 
 % ===========================================================================
 \section{Application 3: Agreement Quality Measurement}
 
 Digests enable two capabilities hash-based protocols cannot provide.
 
-\textbf{Optimistic fast path.} When all validators have complete state, the cluster variance is zero. The aggregator detects this in one round and issues a finality certificate immediately. HotStuff still runs 3 rounds because it cannot measure agreement quality before votes are counted. The fast-path probability is approximately $(1 - p_{\mathrm{miss}})^N$; at $p_{\mathrm{miss}} = 0.05$ and $N = 10$ honest validators (the leaf-group regime) this is $\approx 60\%$, rising to $\approx 90\%$ at $p_{\mathrm{miss}} = 0.01$.
+\textbf{Optimistic fast path.} When all validators have complete state, every Phase 1 message carries a matching commitment. The aggregator collects the commitments in round one and issues the finality certificate immediately (Sect.~\ref{sec:flat}). HotStuff still runs 3 rounds because it cannot measure agreement quality before votes are counted. The fast-path probability is approximately $(1 - p_{\mathrm{miss}})^N$; since this is the probability that every honest validator matches the proposal, while the certificate requires only $2N/3$ matching commitments, it is a lower bound on fast-path engagement. At $p_{\mathrm{miss}} = 0.05$ and $N = 10$ honest validators (the leaf-group regime) it is $\approx 60\%$, rising to $\approx 90\%$ at $p_{\mathrm{miss}} = 0.01$.
 
 \begin{figure}[!htbp]
   \centering
   \includegraphics[width=0.7\textwidth]{fig4_fast_path.png}
-  \caption{Fast path probability as a function of partial-observation rate and honest validator count. Fast path dominates on good networks and decays with packet loss.}
+  \caption{Lower bound on fast-path probability, $(1 - p_{\mathrm{miss}})^N$, as a function of partial-observation rate and honest validator count; engagement requires only $2N/3$ matching commitments. The fast path dominates on good networks and decays with packet loss.}
   \label{fig:fast-path}
 \end{figure}
 
@@ -230,6 +263,9 @@ Digests enable two capabilities hash-based protocols cannot provide.
 
 % ===========================================================================
 \section{Evaluation}
+\label{sec:eval}
+
+Three questions drive the evaluation: whether two phases and tree routing actually reduce message load at scale, whether distributing BLS aggregation across the tree moves the latency bottleneck, and whether either saving costs Byzantine tolerance. All message counts come from a simulation that increments a counter on every send, using identical byte constants for Proxima, HotStuff, and PBFT; latency is projected from published blst microbenchmarks and a three-tier RTT model rather than measured on a deployed testbed, and the caveats in Sect.~\ref{sec:caveats} bound what the projections can claim.
 
 \subsection{Message Complexity}
 
@@ -304,6 +340,7 @@ On a single core the flat aggregator spends $3.96$s aggregating $70{,}000$ BLS s
 \end{figure}
 
 \subsection{Caveats}
+\label{sec:caveats}
 
 \textbf{Multi-threaded baselines partially close the gap.} The tree's $9.9$ms BLS time requires leaf leaders on separate machines; sequential execution on one machine matches flat cost. Conversely, BLS aggregation in flat protocols parallelizes well: a 16-way split reduces flat aggregation to $\sim\!220$ms and each HotStuff round to $\sim\!313$ms. The tree gains little from extra cores. The tree retains an advantage on critical-path BLS time at any core count, but total finality on multi-core hardware additionally depends on whether non-BLS stages parallelize, which we cannot answer without a deployed testbed. The structural advantages, namely message complexity, smaller hierarchical groups, and fast-path finality, are core-count-independent.
 
@@ -324,11 +361,15 @@ The system tolerates up to $33\%$ Byzantine, matching the standard BFT bound. In
 
 % ===========================================================================
 \section{Security Analysis}
+\label{sec:security}
+
+The analysis separates what is proved from what is merely filtered. Safety rests entirely on signed commitments and holds no matter what Phase 1 does; every distance-related mechanism, including the threshold, adversarial digest construction, and bloom false positives, affects only liveness. We prove safety first and then bound each liveness channel in turn.
 
 \subsection{Safety}
 \label{sec:safety}
 
 \begin{theorem}[Safety]
+\label{thm:safety}
 If fewer than $N/3$ validators are Byzantine, Proxima never finalizes two different blocks at the same height.
 \end{theorem}
 
@@ -339,6 +380,8 @@ Finality requires a set $C$ of signed commitments with $|C| \ge 2N/3$, all conta
 \begin{corollary}
 Phase 1 cannot compromise safety. Incorrect inclusion of a Byzantine validator means it fails to produce a valid BLS signature. Incorrect exclusion of an honest validator reduces commit count (liveness) but no incorrect block is signed.
 \end{corollary}
+
+The fast-path certificate is itself a set of at least $2N/3$ signed commitments on $H(B)$, collected in Phase 1 rather than Phase 2, so Theorem~\ref{thm:safety} applies to it verbatim: an aggregator cannot fabricate a fast-path certificate, and a Byzantine aggregator can at most withhold one, delaying the round, which is a liveness effect.
 
 \begin{corollary}
 Tree routing cannot compromise safety. BLS aggregation is associative. A Byzantine tree node can suppress children's signatures (liveness) but cannot forge signatures.
@@ -362,25 +405,14 @@ A natural concern is whether a Byzantine validator can craft a transaction set $
 Bloom filters admit false positives but no false negatives. A false positive causes the aggregator to skip pushing a transaction $V$ needs; $V$'s digest then exceeds $\tau$, $V$ is excluded from the cluster, and $V$ does not sign in Phase 2. The signing set shrinks by one. The chain bloom FP $\rightarrow$ exclusion $\rightarrow$ no signature is wholly a liveness chain: Theorem~1 depends only on collision-resistant hashing and BLS unforgeability, not on cluster membership, so an excluded validator cannot cause a wrong block to clear $2N/3$. The $1\%$ figure is per-lookup, not per-validator: the aggregator queries only flagged stragglers and only against $O(k)$ candidates, where $k$ is the digest-implied gap (typically $1$--$5$), giving a per-validator FP rate of $kp \approx 1$--$5\%$. Filter sizing is linear in transaction count and logarithmic in target FP rate, so scaling the filter with block size to maintain a bounded per-validator rate is a free parameter choice.
 
 % ===========================================================================
-\section{Related Work}
-
-\textbf{BFT Consensus.} PBFT~\cite{castro1999pbft} established practical BFT with $O(N^2)$ message complexity. HotStuff~\cite{yin2019hotstuff} reduced this to $O(N)$ using leader-based aggregation and BLS threshold signatures. Tendermint~\cite{buchman2016tendermint} provides a similar $O(N)$ BFT protocol. All use collision-resistant hashes for state comparison and require full state synchronization before voting. Proxima shares HotStuff's $O(N)$ voting complexity but adds Phase 1 distance-based pre-filtering and bloom-based synchronization.
-
-\textbf{Hierarchical BFT.} Kauri~\cite{kauri} applies tree aggregation to HotStuff, reducing the leader bottleneck. Kauri's tree nodes still run per-group BFT (hash-based), requiring groups large enough for Byzantine tolerance. Proxima's distance filtering removes this requirement, enabling groups of 10 vs 128 and deeper trees (5 levels vs 2--3). Ethereum 2.0~\cite{eth2spec} uses random committees of 128 with per-committee BFT attestation; Proxima achieves similar distributed aggregation with groups $12.8\times$ smaller.
-
-\textbf{DAG-Based Protocols.} Narwhal and Tusk~\cite{narwhal} decouple data availability from consensus via a DAG of validator proposals. Bullshark~\cite{bullshark} builds on Narwhal with a simpler consensus rule. These protocols solve a different problem but share the property that validators may have partial views. Digests could augment DAG protocols by measuring vertex agreement quality.
-
-\textbf{Locality-Sensitive Hashing.} LSH was introduced by Indyk and Motwani~\cite{indyk1998lsh} for approximate nearest-neighbor search. SimHash~\cite{simhash} applies it to document similarity; MinHash~\cite{minhash} to Jaccard similarity; $p$-stable LSH~\cite{pstable} to $L_p$ distances. Our digest is a simple LSH scheme applied to transaction sets. The application to BFT consensus is, to our knowledge, new.
-
-\textbf{Sharding.} Ethereum abandoned execution sharding in favor of data-availability sharding (Danksharding~\cite{danksharding}). NEAR's Nightshade~\cite{nightshade} uses receipt-based communication. Shardeum uses an address-range approach with atomic cross-shard composability. Digest-based verification offers a complementary approach: constant-cost verification per shard pair with conflict resolution only for divergent transactions.
-
-% ===========================================================================
 \section{Implementation}
+\label{sec:implementation}
 
-Proxima is implemented in Python as a working BFT blockchain with account-based state, HTTP node API, interactive demo, benchmarks, and the eight evaluation figures. BLS signatures use py-ecc~\cite{pyecc} for the live demo and hash-based mocks preserving 96-byte signature sizes for large-scale benchmarks. All message counts are tracked by incrementing a counter on each simulated send, using identical byte constants for Proxima, HotStuff, and PBFT; we cross-validated this by running both BLS settings on the small-$N$ demo and confirming identical per-block message totals. Code is available at \url{https://github.com/RyanMercier/Proxima}.
+Proxima is implemented in Python as a working BFT blockchain with account-based state, an HTTP node API, an interactive demo, benchmarks, and the evaluation figures, all reproducible from the repository~\cite{proxima-tr}. Digest computation costs one SHA-512 per transaction: the 64-byte output is split into eight 8-byte segments, each reduced modulo $10^4$ into a coordinate in $[0,1)$, and a validator's digest is the vectorized sum of its transaction vectors, traveling as 64 bytes on the wire. BLS signatures run through two interchangeable code paths: py-ecc~\cite{pyecc} performs real BLS12-381 operations in the live demo, while large-scale benchmarks substitute hash-based mocks that preserve the 96-byte signature and 48-byte public-key wire sizes; we cross-validated the paths by running the small-$N$ demo under both and confirming identical per-block message totals. All message counts are tracked by incrementing a counter on each simulated send, using identical byte constants for Proxima, HotStuff, and PBFT, and the latency projections use published blst~\cite{blst} microbenchmark constants (Sect.~\ref{sec:eval}). On the aggregation side, the implementation computes the reference digest once per block, excludes Byzantine validators before any signature work, synchronizes stragglers with a single bloom-diff push rather than request-response retransmission, aggregates the speculative Phase 1 commitments directly into the fast-path certificate, and in tree mode splits aggregation so that each leaf leader combines only a branching factor's worth of signatures.
 
 % ===========================================================================
 \section{Limitations and Future Work}
+\label{sec:limitations}
 
 \textbf{Projected latency.} All latency numbers use published blst benchmarks and standard RTT estimates. A deployed testbed across 3+ cloud regions would validate the model. The Caveats subsection covers the multi-threaded picture in detail.
 
