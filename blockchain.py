@@ -397,12 +397,19 @@ def vector_consensus(validators: list, block: Block, threshold: float,
     Run two-phase consensus on a proposed block.
 
     Phase 1: each validator sends its vector + bloom to the aggregator.
-    Aggregator clusters by Euclidean distance from the reference vector,
-    diffs blooms to push missing txs. If cluster variance is near zero,
-    finalize in one round (fast path).
+    A validator whose local state matches the proposal also attaches a
+    speculative BLS commitment on the block hash (96 bytes); validators
+    with incomplete views send vector + bloom only. The aggregator clusters
+    by Euclidean distance from the reference vector and diffs blooms to
+    push missing txs. With 2N/3 speculative commitments on the same hash,
+    the aggregator aggregates them and multicasts the finality certificate
+    in one round (fast path). The certificate is the same object Phase 2
+    produces: 96-byte aggregate + N/8-byte signer bitmap.
 
-    Phase 2: cluster members send BLS-signed commits. Aggregator produces
-    an aggregate signature + signer bitmap and multicasts the finality proof.
+    Phase 2 (fallback): cluster members send BLS-signed commits. Aggregator
+    produces an aggregate signature + signer bitmap and multicasts the
+    finality proof. Commitments already received in Phase 1 could be reused
+    here; the accounting conservatively re-collects from the full cluster.
     """
     t0 = time.time()
     msgs = MessageCounter()
@@ -410,9 +417,13 @@ def vector_consensus(validators: list, block: Block, threshold: float,
     n_req = int(math.ceil(n * 2 / 3))
     all_tx_strs = block.tx_data_strings
 
-    # Phase 1: validators send vector + bloom to aggregator
+    # Phase 1: validators send vector + bloom to aggregator. A validator
+    # whose local state matches the proposal attaches a speculative BLS
+    # commitment (96 bytes) on the block hash.
     vectors = {}
     blooms = {}
+    p1_sigs = []
+    p1_signer_ids = []
     for v in validators:
         miss = partial_obs.get(v.id, set()) if partial_obs else set()
         vectors[v.id] = v.get_vector(block, miss)
@@ -420,8 +431,15 @@ def vector_consensus(validators: list, block: Block, threshold: float,
             blooms[v.id] = v.make_bloom(block, miss)
         else:
             blooms[v.id] = None
+        commit_size = 0
+        if not v.is_byzantine and not miss:
+            sig = v.sign_commit(block.block_hash)
+            if sig is not None:
+                p1_sigs.append(sig)
+                p1_signer_ids.append(v.id)
+                commit_size = 96
         bloom_size = blooms[v.id].size_bytes if blooms[v.id] else 0
-        msgs.send("phase1_vector", N_DIMS * 8 + bloom_size)
+        msgs.send("phase1_vector", N_DIMS * 8 + bloom_size + commit_size)
 
     # Aggregator knows the correct block, so the reference vector is the
     # full transaction set vector. Distances are measured from this reference.
@@ -460,13 +478,24 @@ def vector_consensus(validators: list, block: Block, threshold: float,
     phase1_time = time.time() - t0
     cluster_variance = float(np.var([distances[v.id] for v in cluster])) if cluster else 999.0
 
-    # Fast path check: if variance near zero, all cluster members agree
-    fast_path = cluster_variance < 1e-6 and len(cluster) >= n_req
+    # Fast path check: enough speculative commitments arrived in Phase 1 to
+    # finalize without Phase 2. The protocol requires only 2N/3 matching
+    # commitments; the variance gate keeps the simulation on the
+    # conservative unanimity case, the (1 - p_miss)^N lower bound reported
+    # in the paper.
+    fast_path = cluster_variance < 1e-6 and len(p1_sigs) >= n_req
 
     if fast_path:
-        # Single-round finality. No Phase 2 needed.
+        # Single-round finality: aggregate the Phase 1 commitments into the
+        # same certificate object Phase 2 produces (aggregate + bitmap).
+        agg_sig = BLSKeyPair.aggregate(p1_sigs)
+        fp_bitmap = bitarray(n)
+        fp_bitmap.setall(0)
+        for vid in p1_signer_ids:
+            fp_bitmap[vid] = 1
+        finality_proof_size = 96 + len(fp_bitmap.tobytes())
         for _ in cluster:
-            msgs.send("fast_path_finality", 32)
+            msgs.send("fast_path_finality", finality_proof_size)
         total_time = time.time() - t0
         return {
             "finalized": True,
@@ -483,8 +512,9 @@ def vector_consensus(validators: list, block: Block, threshold: float,
             "msg_breakdown": dict(msgs.by_type),
             "sync_pushed": sync_pushed,
             "sync_details": sync_details,
-            "n_commits": len(cluster),
+            "n_commits": len(p1_sigs),
             "n_required": n_req,
+            "finality_proof_bytes": finality_proof_size,
             "distances": {v.name: distances[v.id] for v in validators},
         }
 

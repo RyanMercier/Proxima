@@ -1,7 +1,7 @@
 __pycache__/
 *.pyc
 *.pyo
-figures/
+/figures/
 .env
 *.egg-info/
 dist/

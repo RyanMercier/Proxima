@@ -320,10 +320,10 @@ Three properties hashes do not have:
 
 ### Flat Consensus (vector_consensus)
 
-1. Validators send digest (64 bytes) + bloom filter (25 bytes) to aggregator
+1. Validators send digest (64 bytes) + bloom filter (25 bytes) to aggregator; a validator whose local state matches the proposal also attaches a speculative BLS commitment (96 bytes) on the block hash
 2. Aggregator measures distance from reference, clusters within threshold
 3. Bloom diff pushes missing txs to incomplete validators
-4. If variance near zero: fast path, finalize in 1 round
+4. With 2/3 speculative commitments on the same hash: fast path, the aggregator aggregates them into the finality certificate (96-byte aggregate + signer bitmap, the same object Phase 2 produces) in one round
 5. Otherwise Phase 2: BLS commits, aggregate signature (96 bytes) + bitmap, 2/3 required
 
 ### Tree Consensus (tree_consensus)
