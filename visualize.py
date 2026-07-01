@@ -72,7 +72,9 @@ def _build_chain(n_hon, n_byz, strategy="drop_half", n_txs=20, miss_prob=0.37):
 # Figure 1: Distance-preserving vs distance-destroying
 # =====================================================================
 
-def figure1():
+def figure1(compact=False):
+    """compact=True renders a single-column layout for the camera-ready:
+    identical data (fixed seed), smaller canvas, proportionally larger type."""
     print("Figure 1: Distance comparison...")
     np.random.seed(42)
     txs = [hashlib.sha256(f"tx-{i}".encode()).hexdigest() for i in range(20)]
@@ -93,20 +95,28 @@ def figure1():
             vd.append(np.linalg.norm(compute_vector(sub) - ref_vec))
         sha_d.append(sd); vec_d.append(vd)
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    if compact:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(7, 2.6))
+    else:
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    fs = 9 if compact else None
     for ax, data, color, title in [
         (ax1, sha_d, RED, "SHA-256 (Distance-Destroying)"),
         (ax2, vec_d, BLUE, "Transaction Vectors (Distance-Preserving)")]:
         bp = ax.boxplot(data, tick_labels=[str(m) for m in range(6)],
                         patch_artist=True, widths=0.6)
         for b in bp["boxes"]: b.set_facecolor(color); b.set_alpha(0.7)
-        ax.set_xlabel("Transactions Missing")
-        ax.set_title(title)
-    ax1.set_ylabel("Hamming Distance (hex chars)")
-    ax2.set_ylabel("Euclidean Distance (8D)")
-    fig.suptitle("Why Distance Matters for Consensus", fontsize=14, fontweight="bold", y=1.02)
+        ax.set_xlabel("Transactions Missing", fontsize=fs)
+        ax.set_title(title, fontsize=fs)
+        if compact:
+            ax.tick_params(labelsize=8)
+    ax1.set_ylabel("Hamming Distance (hex chars)", fontsize=fs)
+    ax2.set_ylabel("Euclidean Distance (8D)", fontsize=fs)
+    if not compact:
+        fig.suptitle("Why Distance Matters for Consensus", fontsize=14, fontweight="bold", y=1.02)
     fig.tight_layout()
-    save(fig, "fig1_distance_comparison.png")
+    save(fig, "fig1_distance_comparison_compact.png" if compact
+         else "fig1_distance_comparison.png")
 
 
 # =====================================================================
@@ -167,7 +177,9 @@ def figure2():
 # Figure 3: Byzantine sweep (Tree + Flat + HotStuff)
 # =====================================================================
 
-def figure3():
+def figure3(compact=False):
+    """compact=True renders a single-column layout for the camera-ready:
+    same simulation code and seed, smaller canvas, proportionally larger type."""
     print("Figure 3: Byzantine tolerance sweep...")
     np.random.seed(42)
 
@@ -208,48 +220,65 @@ def figure3():
 
         print(f"    {bp:>2}% byz: flat {fs}/{trials}  tree {ts}/{trials}  hs {hs_ok}/{trials}")
 
-    fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+    if compact:
+        fig, axes = plt.subplots(1, 3, figsize=(7.4, 2.4))
+        fs, ms, lw, leg = 8, 4, 1.6, 5.5
+    else:
+        fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+        fs, ms, lw, leg = None, 7, 2.5, 8
 
     # Success rate
     ax = axes[0]
-    ax.plot(byz_pcts, tree_s, "D-", color=GREEN, lw=2.5, ms=7, label="Proxima Tree")
-    ax.plot(byz_pcts, flat_s, "o-", color=BLUE, lw=2.5, ms=7, label="Proxima Flat")
-    ax.plot(byz_pcts, hs_s, "s--", color=ORANGE, lw=2.5, ms=7, label="HotStuff")
+    ax.plot(byz_pcts, tree_s, "D-", color=GREEN, lw=lw, ms=ms, label="Proxima Tree")
+    ax.plot(byz_pcts, flat_s, "o-", color=BLUE, lw=lw, ms=ms, label="Proxima Flat")
+    ax.plot(byz_pcts, hs_s, "s--", color=ORANGE, lw=lw, ms=ms, label="HotStuff")
     ax.axvline(33, color=RED, ls="--", lw=1.5, alpha=0.7, label="BFT limit (33%)")
     ax.fill_between([33, 45], 0, 100, alpha=0.05, color=RED)
-    ax.set_xlabel("Byzantine Validators (%)"); ax.set_ylabel("Consensus Success (%)")
-    ax.set_title("Consensus Success Rate", fontweight="bold")
-    ax.legend(fontsize=8); ax.set_ylim(-5, 105)
+    ax.set_xlabel("Byzantine Validators (%)", fontsize=fs)
+    ax.set_ylabel("Consensus Success (%)", fontsize=fs)
+    ax.set_title("Consensus Success Rate", fontweight="bold", fontsize=fs)
+    ax.legend(fontsize=leg); ax.set_ylim(-5, 105)
 
     # Messages
     ax = axes[1]
-    ax.plot(byz_pcts, tree_m, "D-", color=GREEN, lw=2.5, ms=7, label="Proxima Tree")
-    ax.plot(byz_pcts, flat_m, "o-", color=BLUE, lw=2.5, ms=7, label="Proxima Flat")
-    ax.plot(byz_pcts, hs_m, "s--", color=ORANGE, lw=2.5, ms=7, label="HotStuff")
+    ax.plot(byz_pcts, tree_m, "D-", color=GREEN, lw=lw, ms=ms, label="Proxima Tree")
+    ax.plot(byz_pcts, flat_m, "o-", color=BLUE, lw=lw, ms=ms, label="Proxima Flat")
+    ax.plot(byz_pcts, hs_m, "s--", color=ORANGE, lw=lw, ms=ms, label="HotStuff")
     ax.axvline(33, color=RED, ls="--", lw=1.5, alpha=0.7)
-    ax.set_xlabel("Byzantine Validators (%)"); ax.set_ylabel("Messages per Block")
-    ax.set_title("Message Cost", fontweight="bold"); ax.legend(fontsize=8)
+    ax.set_xlabel("Byzantine Validators (%)", fontsize=fs)
+    ax.set_ylabel("Messages per Block", fontsize=fs)
+    ax.set_title("Message Cost", fontweight="bold", fontsize=fs)
+    ax.legend(fontsize=leg)
 
     # Bandwidth
     ax = axes[2]
-    ax.plot(byz_pcts, tree_bw, "D-", color=GREEN, lw=2.5, ms=7, label="Proxima Tree")
-    ax.plot(byz_pcts, flat_bw, "o-", color=BLUE, lw=2.5, ms=7, label="Proxima Flat")
-    ax.plot(byz_pcts, hs_bw, "s--", color=ORANGE, lw=2.5, ms=7, label="HotStuff")
+    ax.plot(byz_pcts, tree_bw, "D-", color=GREEN, lw=lw, ms=ms, label="Proxima Tree")
+    ax.plot(byz_pcts, flat_bw, "o-", color=BLUE, lw=lw, ms=ms, label="Proxima Flat")
+    ax.plot(byz_pcts, hs_bw, "s--", color=ORANGE, lw=lw, ms=ms, label="HotStuff")
     ax.axvline(33, color=RED, ls="--", lw=1.5, alpha=0.7)
-    ax.set_xlabel("Byzantine Validators (%)"); ax.set_ylabel("Bandwidth (KB)")
-    ax.set_title("Bandwidth Cost", fontweight="bold"); ax.legend(fontsize=8)
+    ax.set_xlabel("Byzantine Validators (%)", fontsize=fs)
+    ax.set_ylabel("Bandwidth (KB)", fontsize=fs)
+    ax.set_title("Bandwidth Cost", fontweight="bold", fontsize=fs)
+    ax.legend(fontsize=leg)
 
-    fig.suptitle(f"Byzantine Tolerance: N={N}, 37% partial observation, {trials} trials/point",
-                 fontsize=14, fontweight="bold", y=1.02)
+    if compact:
+        for ax in axes:
+            ax.tick_params(labelsize=7)
+    else:
+        fig.suptitle(f"Byzantine Tolerance: N={N}, 37% partial observation, {trials} trials/point",
+                     fontsize=14, fontweight="bold", y=1.02)
     fig.tight_layout()
-    save(fig, "fig3_byzantine_sweep.png")
+    save(fig, "fig3_byzantine_sweep_compact.png" if compact
+         else "fig3_byzantine_sweep.png")
 
 
 # =====================================================================
 # Figure 4: Fast path probability heatmap
 # =====================================================================
 
-def figure4():
+def figure4(compact=False):
+    """compact=True renders a single-column layout for the camera-ready:
+    same formula grid, smaller canvas, proportionally larger type."""
     print("Figure 4: Fast path probability...")
     miss_rates = np.arange(0.0, 0.42, 0.02)
     n_vals = np.array([5, 7, 10, 15, 20, 30, 50, 70, 100])
@@ -259,21 +288,30 @@ def figure4():
         for j, mr in enumerate(miss_rates):
             grid[i, j] = (1 - mr) ** nh * 100
 
-    fig, ax = plt.subplots(figsize=(12, 6))
+    if compact:
+        fig, ax = plt.subplots(figsize=(6.4, 2.8))
+        fs, cellfs = 8, 5.5
+    else:
+        fig, ax = plt.subplots(figsize=(12, 6))
+        fs, cellfs = None, 7
     im = ax.imshow(grid, aspect="auto", origin="lower", cmap="RdYlGn", vmin=0, vmax=100,
                    extent=[miss_rates[0]*100, miss_rates[-1]*100, -0.5, len(n_vals)-0.5])
     ax.set_yticks(range(len(n_vals)))
     ax.set_yticklabels([str(n) for n in n_vals])
-    ax.set_xlabel("Per-Validator Probability of Missing 1-2 Txs (%)")
-    ax.set_ylabel("Number of Honest Validators")
-    fig.colorbar(im, ax=ax, label="Fast Path Probability (%)")
+    ax.set_xlabel("Per-Validator Probability of Missing 1-2 Txs (%)", fontsize=fs)
+    ax.set_ylabel("Honest Validators", fontsize=fs)
+    cb = fig.colorbar(im, ax=ax)
+    cb.set_label("Fast Path Probability (%)", fontsize=fs)
+    if compact:
+        ax.tick_params(labelsize=7)
+        cb.ax.tick_params(labelsize=7)
 
     for i, nh in enumerate(n_vals):
         for j, mr in enumerate(miss_rates):
             if j % 3 == 0:
                 val = grid[i, j]
                 ax.text(mr*100, i, f"{val:.0f}", ha="center", va="center",
-                        fontsize=7, color="white" if val < 40 else "black", fontweight="bold")
+                        fontsize=cellfs, color="white" if val < 40 else "black", fontweight="bold")
 
     # 50% contour
     cx, cy = [], []
@@ -285,12 +323,13 @@ def figure4():
                 cy.append(i); break
     if cx:
         ax.plot(cx, cy, "k--", lw=2, alpha=0.7, label="50% fast path")
-        ax.legend(fontsize=10, loc="upper right")
+        ax.legend(fontsize=7 if compact else 10, loc="upper right")
 
-    ax.set_title("Optimistic Fast Path: P(fast path) = (1 - miss_rate) ^ N_honest",
-                 fontsize=13, fontweight="bold")
+    if not compact:
+        ax.set_title("Optimistic Fast Path: P(fast path) = (1 - miss_rate) ^ N_honest",
+                     fontsize=13, fontweight="bold")
     fig.tight_layout()
-    save(fig, "fig4_fast_path.png")
+    save(fig, "fig4_fast_path_compact.png" if compact else "fig4_fast_path.png")
 
 
 # =====================================================================
@@ -680,15 +719,24 @@ def figure8():
 
 def main():
     t0 = time.time()
-    print("Generating figures...\n")
-    figure1()
-    figure2()
-    figure3()
-    figure4()
-    figure5()
-    figure6()
-    figure7()
-    figure8()
+    import sys
+    if "--compact" in sys.argv:
+        # Single-column variants for the LNCS camera-ready: identical data,
+        # smaller canvas, proportionally larger type.
+        print("Generating compact camera-ready figures...\n")
+        figure1(compact=True)
+        figure3(compact=True)
+        figure4(compact=True)
+    else:
+        print("Generating figures...\n")
+        figure1()
+        figure2()
+        figure3()
+        figure4()
+        figure5()
+        figure6()
+        figure7()
+        figure8()
     print(f"\nDone in {time.time()-t0:.1f}s. Figures in {OUT}/")
 
 
