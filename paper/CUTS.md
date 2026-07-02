@@ -152,6 +152,23 @@ present in text.
   background sentences; the multi-core qualitative hedge moved out of the
   abstract (it remains in the Caveats paragraph and Table 2's caption).
 
+## Post-verification corrections (adversarial review pass)
+
+- Sect. 5, fast-path paragraph: dropped the "(the leaf-group regime)"
+  parenthetical from the $N{=}10$ example; the label contradicted the
+  corrected fast path's flat-only scope (the numbers 60%/90% at
+  $p_{\mathrm{miss}} = 0.05/0.01$ are unchanged).
+- Sect. 1: restored the submitted paper's causal framing for HotStuff's
+  three rounds ("no way to detect unanimous agreement before the votes are
+  counted"); a condensation pass had misattributed the cause to
+  collision-resistant certificates, which the corrected mechanism itself
+  contradicts.
+- Sect. 2: added the missing lead-in sentence (B1 applies to every
+  section).
+- Sect. 6: reinstated "than two-phase commit" in the receipt-latency
+  sentence so the paper matches the B8 rewrite quoted in the changes
+  document.
+
 ## Never cut (verified present)
 
 Theorem 1 with proof, both corollary statements, the fast-path safety
