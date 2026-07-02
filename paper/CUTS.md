@@ -48,13 +48,12 @@ present in text.
   states the measured distances (~1.6 / ~3.0 / ~14.5 at k = 1/2/10) and the
   contrast with hashes. A compact single-column variant was generated
   (visualize.py --compact) and remains in figures/ should space open up.
-- IEEE Fig. 2 (fig9_protocol_flow): kept as Fig. 1, cropped at the pixel
-  level to the three Proxima columns (fig9_protocol_flow_proxima.png,
-  x < 1655 of 2200). The removed right-hand column was a HotStuff
-  three-round comparison strip, which duplicates the B9 HotStuff
-  description added to the introduction (Phase D priority 5). Cropping,
-  not redrawing; the master PNG is untouched and its required label edits
-  are documented in BLOCKERS.md.
+- IEEE Fig. 2 (fig9_protocol_flow): kept as Fig. 1. Initially cropped at
+  the pixel level to the three Proxima columns; later replaced entirely by
+  a script-generated redraw (`protocol_flow_diagram.py`, manim, output
+  fig_protocol_flow.png) whose labels show the corrected fast-path
+  mechanism. The removed HotStuff comparison strip duplicates the B9
+  HotStuff description added to the introduction (Phase D priority 5).
 - IEEE Fig. 3 (fig8_cross_shard, 2 panels): dropped. Table 1 carries the
   95%-propagation operating point (5,052 msgs / 987 KB / 52 cross-shard);
   the text states the 100%-propagation floor (2 messages) and that cost

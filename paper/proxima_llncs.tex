@@ -106,7 +106,7 @@ Proxima runs two phases: Phase~1 measures agreement geometrically and repairs st
 
 \begin{figure}[tbp]
   \centering
-  \includegraphics[width=0.7\textwidth]{fig9_protocol_flow_proxima.png}
+  \includegraphics[width=0.7\textwidth]{fig_protocol_flow.png}
   \caption{Two-phase Proxima protocol with speculative fast path. Phase 1 messages carry digest, bloom, and, from each validator whose local state matches the proposal, a conditional BLS commitment ($64+25+96$ bytes); with $\ge 2N/3$ matching commitments collected in round one, the aggregator aggregates them into the finality certificate (96-byte aggregate plus $N/8$-byte signer bitmap, the same object Phase 2 produces) and finalizes in one round trip.}
   \label{fig:protocol-flow}
 \end{figure}
@@ -247,7 +247,7 @@ Liveness holds when $f < N/3$, the threshold includes at least $2N/3$ honest val
 
 Collision-resistant hashing imposes three constraints on BFT consensus (mandatory state synchronization, unmeasurable agreement quality, large hierarchical committees); distance-preserving digests remove all three, with safety proved independently of the digest. At $N{=}100{,}000$, Proxima Tree uses $2.2\times$ fewer messages than HotStuff and reduces cross-shard overhead by $99\%$ versus 2PC at $95\%$ propagation; single-core finality is $\sim\!0.9$s vs $\sim\!18$s. The primitive applies to any BFT protocol that compares state via hashes.
 
-\looseness=-1 Four limitations bound these claims. \textbf{Projected latency:} all latency numbers use published blst benchmarks and standard RTT estimates; a deployed testbed across 3+ cloud regions would validate the model (multi-threading caveats in Sect.~\ref{sec:eval}). \textbf{No comparison against hierarchical HotStuff:} comparing against Kauri would isolate distance filtering from tree aggregation, the most important missing evaluation. \textbf{Adaptive adversary:} the safety proof assumes static Byzantine assignment; defending against corruption that follows tree assignments requires VRF-based assignment with epoch rotation, described but not evaluated. \textbf{Cross-shard propagation:} the $95\%$ propagation rate is consistent with typical gossip propagation at multi-second block intervals but not validated on a sharded testbed.
+\looseness=-1 Five limitations bound these claims. \textbf{Tree fast path:} carrying speculative commitments up the tree requires per-group signer bitmaps and is deferred (Sect.~\ref{sec:flat}). \textbf{Projected latency:} all latency numbers use published blst benchmarks and standard RTT estimates; a deployed testbed across 3+ cloud regions would validate the model (multi-threading caveats in Sect.~\ref{sec:eval}). \textbf{No comparison against hierarchical HotStuff:} comparing against Kauri would isolate distance filtering from tree aggregation, the most important missing evaluation. \textbf{Adaptive adversary:} the safety proof assumes static Byzantine assignment; defending against corruption that follows tree assignments requires VRF-based assignment with epoch rotation, described but not evaluated. \textbf{Cross-shard propagation:} the $95\%$ propagation rate is consistent with typical gossip propagation at multi-second block intervals but not validated on a sharded testbed.
 
 % ===========================================================================
 \bibliographystyle{splncs04}
