@@ -11,3 +11,10 @@ build/
 benchmark_results.json
 cross_shard_results.json
 
+# LaTeX build artifacts
+paper_v2/*.log
+paper_v2/*.aux
+paper_v2/*.bbl
+paper_v2/*.blg
+paper_v2/*.out
+
