@@ -1,9 +1,21 @@
 """
-blockchain.py -- Core protocol implementation.
+blockchain.py -- Core protocol implementation (v2).
 
-Transaction vector encoding (SHA-512 -> 8D), bloom filters for set
-reconciliation, BLS aggregate signatures, and the two-phase consensus
-with optimistic fast path. Everything else imports from here.
+Distance-preserving multiset hashes (dpmh.py: zero-mean Rademacher digests,
+n = 512, two domains), IBLT set reconciliation replacing bloom filters
+(reconcile.py), BLS aggregate signatures, and the two-phase consensus with
+the speculative fast path. v2 protocol changes over the camera-ready:
+
+- Closed-form clustering threshold tau^2 = 3n (Monte Carlo calibration is
+  demoted to validation).
+- Byzantine-robust reference: coordinate-wise median of the submitted
+  Phase 1 digests instead of the aggregator's own state.
+- Honest-sufficient fast-path trigger: >= 2N/3 matching commitments, no
+  variance gate (one in-cluster Byzantine can no longer grief the fast path).
+- Straggler sync via estimate-then-decode (digest distance sizes an IBLT,
+  which recovers exactly the missing transactions; no false positives).
+- Cumulative ledger accumulators per chain for O(log H) fork localization.
+- Readiness sensing and partition healing helpers (end of file).
 """
 
 import hashlib
@@ -15,7 +27,12 @@ from typing import Dict, List, Set, Optional, Tuple
 import numpy as np
 from bitarray import bitarray
 
-N_DIMS = 8
+import dpmh
+import reconcile
+
+N_DIMS = dpmh.N_ROUND          # digest dimension (v2: 512, was 8)
+DIGEST_WIRE = dpmh.wire_bytes("round")   # 1024 B round digest on the wire
+SUMMARY_BYTES = DIGEST_WIRE + 4 + 8      # exact sum + count + sumsq dist
 MAX_SUPPLY = 21_000_000.0
 INITIAL_REWARD = 50.0
 HALVING_INTERVAL = 210_000
@@ -105,33 +122,43 @@ class BloomFilter:
 # Transaction vector encoding
 # ---------------------------------------------------------------------------
 
-def tx_to_vector(tx_data: str) -> np.ndarray:
-    """SHA-512 split into 8 segments, each mapped to [0, 1). Returns 8D vector."""
-    h = hashlib.sha512(tx_data.encode()).digest()
-    return np.array([
-        int.from_bytes(h[d * 8:(d + 1) * 8], 'big') % 10000 / 10000.0
-        for d in range(N_DIMS)
-    ])
+def tx_to_vector(tx_data: str, height: int = 0) -> np.ndarray:
+    """Rademacher vector in {-1,+1}^n, salted by round height (dpmh)."""
+    return dpmh.tx_vector(tx_data, height)
 
-def compute_vector(tx_list: list) -> np.ndarray:
-    """Commutative sum of transaction vectors."""
+def compute_vector(tx_list: list, height: int = 0) -> np.ndarray:
+    """Commutative integer sum of transaction vectors (round domain)."""
     if not tx_list:
-        return np.zeros(N_DIMS)
-    return np.sum([tx_to_vector(tx) for tx in tx_list], axis=0)
+        return np.zeros(N_DIMS, dtype=np.int64)
+    return dpmh.digest(tx_list, height)
 
-def calibrate_threshold(txs: list, max_miss: int = 2, percentile: int = 99,
-                        margin: float = 1.2) -> float:
-    """Sample 2000 partial observations, take p99 distance * margin as threshold."""
-    if len(txs) < 2:
-        return 5.0
-    honest = compute_vector(txs)
-    dists = []
-    for _ in range(2000):
+def calibrate_threshold(txs: list = None, max_miss: int = 2,
+                        percentile: int = 99, margin: float = 1.2) -> float:
+    """v2: the threshold is closed form, tau = sqrt(3n).
+
+    E||dD||^2 = n d for d missing transactions, so tau^2 = 3n admits honest
+    stragglers (d <= max_miss = 2) except with probability exp(-n/8) and
+    excludes d >= 4 fabrications. The arguments are kept for call-site
+    compatibility; nothing is sampled. Monte Carlo lives on only as
+    validation (validate_threshold below, dpmh.validate_estimator).
+    """
+    return dpmh.tau()
+
+def validate_threshold(txs: list, max_miss: int = 2, trials: int = 2000,
+                       height: int = 0) -> dict:
+    """Monte Carlo validation of the closed-form threshold (not protocol)."""
+    honest = compute_vector(txs, height)
+    tau2 = dpmh.tau2()
+    exceed = 0
+    for _ in range(trials):
         n_miss = np.random.randint(1, max_miss + 1)
-        missing = set(np.random.choice(len(txs), size=min(n_miss, len(txs)), replace=False))
+        missing = set(np.random.choice(len(txs), size=min(n_miss, len(txs)),
+                                       replace=False))
         partial = [tx for j, tx in enumerate(txs) if j not in missing]
-        dists.append(np.linalg.norm(compute_vector(partial) - honest))
-    return float(np.percentile(dists, percentile) * margin)
+        if dpmh.dist2(compute_vector(partial, height), honest) > tau2:
+            exceed += 1
+    return {"trials": trials, "exceed": exceed,
+            "rate": exceed / trials, "bound": math.exp(-dpmh.N_ROUND / 8)}
 
 
 # ---------------------------------------------------------------------------
@@ -344,7 +371,7 @@ class Validator:
         strs = block.tx_data_strings
         if missing:
             strs = [s for i, s in enumerate(strs) if i not in missing]
-        return compute_vector(strs)
+        return compute_vector(strs, block.height)
 
     def make_bloom(self, block: Block, missing: Optional[Set[int]] = None) -> BloomFilter:
         strs = block.tx_data_strings
@@ -357,23 +384,27 @@ class Validator:
 
     def _byzantine_vector(self, block: Block) -> np.ndarray:
         strs = block.tx_data_strings
+        h = block.height
         if not strs:
-            return np.random.uniform(0, 15, size=N_DIMS)
+            return np.random.randint(-8, 9, size=N_DIMS).astype(np.int64)
         if self.strategy == "drop_half":
-            return compute_vector(strs[::2])
+            return compute_vector(strs[::2], h)
         elif self.strategy == "random_vector":
-            return np.random.uniform(0, 15, size=N_DIMS)
+            # Fabricated state: random integer digest at block scale.
+            scale = max(len(strs), 1)
+            return np.random.randint(-scale, scale + 1,
+                                     size=N_DIMS).astype(np.int64)
         elif self.strategy == "replace_one_tx":
             m = list(strs)
             m[min(1, len(m) - 1)] = hashlib.sha256(b"FRAUD").hexdigest()
-            return compute_vector(m)
+            return compute_vector(m, h)
         elif self.strategy == "mimic_honest":
             m = list(strs)
             m[0] = hashlib.sha256(b"SLIGHT").hexdigest()
-            return compute_vector(m)
+            return compute_vector(m, h)
         elif self.strategy == "coalition":
-            return compute_vector(strs[:len(strs) // 2])
-        return compute_vector(strs)
+            return compute_vector(strs[:len(strs) // 2], h)
+        return compute_vector(strs, h)
 
     def sign_commit(self, block_hash: str) -> Optional[bytes]:
         if self.is_byzantine:
@@ -394,17 +425,23 @@ class Validator:
 def vector_consensus(validators: list, block: Block, threshold: float,
                      partial_obs: Optional[dict] = None) -> dict:
     """
-    Run two-phase consensus on a proposed block.
+    Run two-phase consensus on a proposed block (v2 protocol).
 
-    Phase 1: each validator sends its vector + bloom to the aggregator.
-    A validator whose local state matches the proposal also attaches a
-    speculative BLS commitment on the block hash (96 bytes); validators
-    with incomplete views send vector + bloom only. The aggregator clusters
-    by Euclidean distance from the reference vector and diffs blooms to
-    push missing txs. With 2N/3 speculative commitments on the same hash,
-    the aggregator aggregates them and multicasts the finality certificate
-    in one round (fast path). The certificate is the same object Phase 2
-    produces: 96-byte aggregate + N/8-byte signer bitmap.
+    Phase 1: each validator sends its digest (n=512 Rademacher, 1024 B) to
+    the aggregator; a validator whose local state matches the proposal also
+    attaches a speculative BLS commitment on the block hash (96 bytes). The
+    aggregator forms a Byzantine-robust reference (coordinate-wise median
+    of the submitted digests), clusters by integer squared distance against
+    tau^2 = 3n, and synchronizes stragglers by estimate-then-decode: the
+    digest distance sizes an IBLT, which recovers exactly the missing
+    transactions (no blooms, no false positives).
+
+    Fast path (honest-sufficient trigger): with >= 2N/3 commitments on the
+    same hash, the aggregator aggregates them and multicasts the finality
+    certificate in one round. The certificate is the same object Phase 2
+    produces: 96-byte aggregate + N/8-byte signer bitmap. No variance gate:
+    a near-threshold Byzantine cannot block the trigger, because the honest
+    2N/3 all match below the corruption bound.
 
     Phase 2 (fallback): cluster members send BLS-signed commits. Aggregator
     produces an aggregate signature + signer bitmap and multicasts the
@@ -416,21 +453,15 @@ def vector_consensus(validators: list, block: Block, threshold: float,
     n = len(validators)
     n_req = int(math.ceil(n * 2 / 3))
     all_tx_strs = block.tx_data_strings
+    tau2 = int(round(threshold * threshold))   # integer decision threshold
 
-    # Phase 1: validators send vector + bloom to aggregator. A validator
-    # whose local state matches the proposal attaches a speculative BLS
-    # commitment (96 bytes) on the block hash.
+    # Phase 1: validators send digest (+ conditional commitment).
     vectors = {}
-    blooms = {}
     p1_sigs = []
     p1_signer_ids = []
     for v in validators:
         miss = partial_obs.get(v.id, set()) if partial_obs else set()
         vectors[v.id] = v.get_vector(block, miss)
-        if not v.is_byzantine:
-            blooms[v.id] = v.make_bloom(block, miss)
-        else:
-            blooms[v.id] = None
         commit_size = 0
         if not v.is_byzantine and not miss:
             sig = v.sign_commit(block.block_hash)
@@ -438,38 +469,44 @@ def vector_consensus(validators: list, block: Block, threshold: float,
                 p1_sigs.append(sig)
                 p1_signer_ids.append(v.id)
                 commit_size = 96
-        bloom_size = blooms[v.id].size_bytes if blooms[v.id] else 0
-        msgs.send("phase1_vector", N_DIMS * 8 + bloom_size + commit_size)
+        msgs.send("phase1_vector", DIGEST_WIRE + commit_size)
 
-    # Aggregator knows the correct block, so the reference vector is the
-    # full transaction set vector. Distances are measured from this reference.
-    reference = compute_vector(all_tx_strs)
+    # Byzantine-robust reference: coordinate-wise median of what was
+    # actually submitted (breakdown 1/2 per coordinate), verifiable by any
+    # validator from the signed Phase 1 digests. The aggregator's own state
+    # is no longer a manipulation point.
+    reference = dpmh.robust_reference([vectors[v.id] for v in validators])
 
     cluster = []
     excluded = []
     distances = {}
+    dist2s = {}
     for v in validators:
-        d = float(np.linalg.norm(vectors[v.id] - reference))
-        distances[v.id] = d
-        if d < threshold:
+        d2 = dpmh.dist2(vectors[v.id], reference)
+        dist2s[v.id] = d2
+        distances[v.id] = math.sqrt(d2)       # float, reporting only
+        if d2 <= tau2:
             cluster.append(v)
         else:
             excluded.append(v)
 
-    # Bloom filter sync: aggregator pushes missing txs to incomplete validators
+    # Straggler sync, estimate-then-decode: d_hat = dist2/n sizes an IBLT;
+    # the decode identifies exactly the missing transactions, which the
+    # aggregator then pushes. Wire cost: one sketch + the pushed payloads.
     sync_pushed = 0
     sync_details = []
     if partial_obs:
         for v in cluster:
             if v.is_byzantine or v.id not in partial_obs:
                 continue
-            bf = blooms.get(v.id)
-            if bf:
-                missing_strs = bf.missing_from(all_tx_strs)
-                if missing_strs:
-                    sync_pushed += len(missing_strs)
-                    sync_details.append((v.name, len(missing_strs)))
-                    msgs.send("sync_push", len(missing_strs) * 200)
+            missing = partial_obs.get(v.id, set())
+            if not missing:
+                continue
+            d_hat = max(1, round(dist2s[v.id] / N_DIMS))
+            msgs.send("sync_iblt", reconcile.sync_cost(d_hat))
+            sync_pushed += len(missing)
+            sync_details.append((v.name, len(missing)))
+            msgs.send("sync_push", len(missing) * 200)
 
     # Cluster assignment broadcast (multicast to cluster members)
     for _ in cluster:
@@ -478,12 +515,11 @@ def vector_consensus(validators: list, block: Block, threshold: float,
     phase1_time = time.time() - t0
     cluster_variance = float(np.var([distances[v.id] for v in cluster])) if cluster else 999.0
 
-    # Fast path check: enough speculative commitments arrived in Phase 1 to
-    # finalize without Phase 2. The protocol requires only 2N/3 matching
-    # commitments; the variance gate keeps the simulation on the
-    # conservative unanimity case, the (1 - p_miss)^N lower bound reported
-    # in the paper.
-    fast_path = cluster_variance < 1e-6 and len(p1_sigs) >= n_req
+    # Fast path: honest-sufficient trigger. Fire iff >= 2N/3 valid
+    # commitments on the same hash arrived in round one. No global
+    # statistic (variance) is consulted, so no adversary below the
+    # corruption bound can suppress an otherwise-ready fast path.
+    fast_path = len(p1_sigs) >= n_req
 
     if fast_path:
         # Single-round finality: aggregate the Phase 1 commitments into the
@@ -603,7 +639,8 @@ def tree_consensus(validators: list, block: Block, threshold: float,
     n = len(validators)
     n_req = int(math.ceil(n * 2 / 3))
     all_tx_strs = block.tx_data_strings
-    reference = compute_vector(all_tx_strs)
+    reference = compute_vector(all_tx_strs, block.height)
+    tau2 = int(round(threshold * threshold))
 
     # Build tree structure: split validators into leaf groups
     leaf_groups = [validators[i:i + branching]
@@ -628,47 +665,44 @@ def tree_consensus(validators: list, block: Block, threshold: float,
 
     for group in leaf_groups:
         vectors = {}
-        blooms = {}
 
         for v in group:
             miss = partial_obs.get(v.id, set()) if partial_obs else set()
             vectors[v.id] = v.get_vector(block, miss)
-            if not v.is_byzantine:
-                blooms[v.id] = v.make_bloom(block, miss)
-            else:
-                blooms[v.id] = None
-            bloom_size = blooms[v.id].size_bytes if blooms[v.id] else 0
-            msgs.send("L0_vector", N_DIMS * 8 + bloom_size)
+            msgs.send("L0_vector", DIGEST_WIRE)
 
         # Distance filter against reference (not group mean)
         included = []
         included_vecs = []
         for v in group:
-            d = float(np.linalg.norm(vectors[v.id] - reference))
-            if d < threshold:
+            d2 = dpmh.dist2(vectors[v.id], reference)
+            if d2 <= tau2:
                 included.append(v)
                 included_vecs.append(vectors[v.id])
                 passed_filter.add(v.id)
             else:
                 total_excluded += 1
 
-        # Bloom sync for included validators with partial observation
+        # Straggler sync: digest distance sizes an IBLT, the decode
+        # identifies the missing txs exactly, the leaf leader pushes them.
         if partial_obs:
             for v in included:
                 if v.is_byzantine or v.id not in partial_obs:
                     continue
-                bf = blooms.get(v.id)
-                if bf:
-                    missing = bf.missing_from(all_tx_strs)
-                    if missing:
-                        total_sync += len(missing)
-                        msgs.send("L0_sync", len(missing) * 200)
+                missing = partial_obs.get(v.id, set())
+                if missing:
+                    d_hat = max(1, round(
+                        dpmh.dist2(vectors[v.id], reference) / N_DIMS))
+                    msgs.send("L0_sync_iblt", reconcile.sync_cost(d_hat))
+                    total_sync += len(missing)
+                    msgs.send("L0_sync", len(missing) * 200)
 
         # Leaf summary: weighted mean of included vectors
         if included_vecs:
             leaf_mean = np.mean(included_vecs, axis=0)
-            leaf_var = float(np.var([np.linalg.norm(v - reference)
-                                     for v in included_vecs]))
+            leaf_var = float(np.var([np.linalg.norm(
+                (v - reference).astype(np.float64))
+                for v in included_vecs]))
             leaf_count = len(included)
         else:
             # All validators in this leaf were excluded
@@ -677,8 +711,9 @@ def tree_consensus(validators: list, block: Block, threshold: float,
             leaf_count = 0
 
         leaf_summaries.append((leaf_mean, leaf_count, leaf_var))
-        # Leaf leader sends 76-byte summary upstream
-        msgs.send("L0_summary", 76)
+        # Leaf leader sends its exact summary upstream (digest sum encoded
+        # mod q + count + sum of squared distances).
+        msgs.send("L0_summary", SUMMARY_BYTES)
 
     level_stats.append({
         "level": 0,
@@ -709,8 +744,8 @@ def tree_consensus(validators: list, block: Block, threshold: float,
                 agg_var = 0.0
 
             next_summaries.append((agg_mean, total_count, agg_var))
-            # Internal node sends 76-byte summary upstream
-            msgs.send(f"L{level}_summary", 76)
+            # Internal node sends its aggregated exact summary upstream
+            msgs.send(f"L{level}_summary", SUMMARY_BYTES)
 
         level_stats.append({
             "level": level,
@@ -722,7 +757,8 @@ def tree_consensus(validators: list, block: Block, threshold: float,
 
     # Root: check global weighted mean
     root_mean, root_count, root_var = current_summaries[0]
-    global_dist = float(np.linalg.norm(root_mean - reference))
+    global_dist = float(np.linalg.norm(
+        (root_mean - reference).astype(np.float64)))
 
     phase1_time = time.time() - t0
 
@@ -837,6 +873,9 @@ class Blockchain:
         self.chain: List[Block] = []
         self.mempool: List[Transaction] = []
         self.consensus_log: list = []
+        # v2: cumulative ledger-domain accumulator, P[b] per block height.
+        # Enables O(1) range digests and O(log H) fork localization.
+        self.ledger_acc = dpmh.Accumulator()
 
     @property
     def height(self) -> int:
@@ -902,10 +941,19 @@ class Blockchain:
         # Miner gets fees
         self.state.balances[block.proposer] = self.state.bal(block.proposer) + fees
         self.chain.append(block)
+        self.ledger_acc.append_block(block.tx_data_strings)
         # Clear finalized txs from mempool
         done = {tx.tx_hash for tx in block.transactions if isinstance(tx, Transaction)}
         self.mempool = [tx for tx in self.mempool if tx.tx_hash not in done]
         return True
+
+    def range_digest(self, a: int, b: int):
+        """Ledger digest of all transactions in blocks (a, b], O(1)."""
+        return self.ledger_acc.range_digest(a, b)
+
+    def find_fork_with(self, other: "Blockchain") -> dict:
+        """Locate the fork point against another chain in O(log H) probes."""
+        return dpmh.find_fork(self.ledger_acc, other.ledger_acc)
 
     def mine_block(self, proposer: Validator, threshold: float,
                    partial_obs: Optional[dict] = None) -> Tuple[bool, dict]:
@@ -973,3 +1021,111 @@ def make_partial_obs(validators: list, n_txs: int,
             n_miss = np.random.randint(1, max_miss + 1)
             obs[v.id] = set(np.random.choice(n_txs, size=min(n_miss, n_txs), replace=False))
     return obs
+
+
+# ---------------------------------------------------------------------------
+# v2: readiness sensing (sense, then propose)
+# ---------------------------------------------------------------------------
+
+def readiness_sense(validators: list, block: Block, threshold: float,
+                    initial_obs: dict, fill_prob: float = 0.5,
+                    quorum_margin: int = 0, max_ticks: int = 20) -> dict:
+    """Sense the digest cloud and propose only when it has converged.
+
+    v1 treats the fast-path probability (1 - p_miss)^N as weather. With
+    digests piggybacked on gossip, the proposer can *measure* readiness:
+    each gossip tick, every missing transaction independently arrives with
+    probability fill_prob, validators' piggybacked digests update, and the
+    proposer counts how many digests match the proposal exactly. It
+    proposes when matches >= 2N/3 + quorum_margin (an honest-sufficient
+    condition), or at max_ticks.
+
+    Sensing rides on gossip traffic that flows anyway, so the accounting
+    adds no messages for observation; the payoff is measured by comparing
+    fast-path engagement with and without sensing at identical fill
+    dynamics. Returns the ticks waited and the consensus result.
+    """
+    n = len(validators)
+    n_req = int(math.ceil(n * 2 / 3)) + quorum_margin
+    obs = {vid: set(m) for vid, m in initial_obs.items()}
+    honest_ids = [v.id for v in validators if not v.is_byzantine]
+
+    ticks = 0
+    while ticks < max_ticks:
+        matches = sum(1 for vid in honest_ids if not obs.get(vid))
+        if matches >= n_req:
+            break
+        ticks += 1
+        for vid in list(obs.keys()):
+            remaining = {i for i in obs[vid]
+                         if np.random.random() >= fill_prob}
+            if remaining:
+                obs[vid] = remaining
+            else:
+                del obs[vid]
+
+    result = vector_consensus(validators, block, threshold, obs)
+    result["sense_ticks"] = ticks
+    result["sensed_matches"] = sum(1 for vid in honest_ids
+                                   if not obs.get(vid))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# v2: partition detection and healing
+# ---------------------------------------------------------------------------
+
+def split_bimodal(digests: dict) -> Tuple[list, list]:
+    """Split a digest cloud into two camps (farthest-pair seeding).
+
+    Returns two lists of ids. Exact centroid arithmetic (integer sums,
+    verifier-side division) means any observer of the signed digests
+    computes the same split.
+    """
+    ids = list(digests.keys())
+    if len(ids) < 2:
+        return ids, []
+    # Seed with the farthest pair (O(k^2) over unique digests is fine at
+    # simulation scale; production would seed from cluster stats).
+    best = (ids[0], ids[1])
+    best_d = -1
+    for i in range(len(ids)):
+        for j in range(i + 1, len(ids)):
+            d = dpmh.dist2(digests[ids[i]], digests[ids[j]])
+            if d > best_d:
+                best_d = d
+                best = (ids[i], ids[j])
+    seed_a, seed_b = best
+    camp_a, camp_b = [], []
+    for vid in ids:
+        da = dpmh.dist2(digests[vid], digests[seed_a])
+        db = dpmh.dist2(digests[vid], digests[seed_b])
+        (camp_a if da <= db else camp_b).append(vid)
+    return camp_a, camp_b
+
+
+def heal_partition(set_a: set, set_b: set, height: int = 0) -> dict:
+    """Reconcile two camps after a partition.
+
+    The camp centroids are exact by linearity, so the inter-camp
+    divergence d_hat = ||mu_a - mu_b||^2 / n is measurable before any
+    reconciliation traffic flows; one estimate-then-decode exchange
+    between camp representatives then recovers exactly the divergent
+    transactions and the union is pushed. Cost scales with the true
+    divergence, not with state size. Hash-based protocols observe only
+    quorum failure here.
+    """
+    d_a = dpmh.digest(sorted(set_a), height)
+    d_b = dpmh.digest(sorted(set_b), height)
+    d_hat = dpmh.est_symdiff(d_a, d_b)
+    rec = reconcile.reconcile(set_a, set_b, d_hint=max(1.0, d_hat))
+    union = set(set_a) | set(set_b)
+    healed = set(set_a) | rec["only_b"]
+    return {
+        "d_hat": d_hat,
+        "true_d": rec["true_d"],
+        "recovered_union": healed == union and rec["ok"],
+        "bytes": rec["bytes"],
+        "rounds": rec["rounds"],
+        "push_bytes": (len(rec["only_a"]) + len(rec["only_b"])) * 200,
+    }

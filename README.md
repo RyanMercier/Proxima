@@ -6,6 +6,39 @@ Every BFT consensus protocol uses collision-resistant hashes to compare validato
 
 Proxima replaces collision-resistant hashes with distance-preserving transaction digests. SHA-512 output is split into 8 segments, summed across transactions, producing an 8D vector where Euclidean distance is proportional to disagreement. This single primitive removes all three constraints: agreement is measurable in one round, tree groups need only 10 validators (vs Ethereum's 128), and cross-shard consistency costs 128 bytes per shard pair instead of per-transaction coordination.
 
+## v2 (branch `v2`, in progress)
+
+The `v2` branch upgrades the primitive and protocol per `docs/v2_plan.md`
+and `docs/v2_formal_foundations.md`:
+
+- **dpmh.py**: zero-mean Rademacher digests (n = 512, {-1,+1} coordinates,
+  integer sums), two domains (height-salted round digests, fixed-salt
+  ledger accumulators, mod-q wire encoding). dist2/n is an unbiased
+  estimator of the multiset symmetric difference (RSE <= sqrt(2/n)), the
+  clustering threshold is closed form (tau^2 = 3n, Monte Carlo demoted to
+  validation), substitutions read their true size (v1's blind spot), and
+  cumulative accumulators give O(1) range digests, O(log H) fork
+  localization, and verifiable prune accounting.
+- **reconcile.py**: IBLT set reconciliation replaces bloom filters
+  everywhere (estimate with the digest, decode with the IBLT; exact
+  recovery, no false positives, bytes proportional to the true difference).
+- **blockchain.py**: Byzantine-robust reference (coordinate-wise median of
+  submitted digests), honest-sufficient fast-path trigger (>= 2N/3
+  commitments, no variance gate, so one in-cluster Byzantine can no longer
+  grief the fast path), readiness sensing (propose when the digest cloud
+  has converged), partition healing at cost proportional to divergence.
+- **conservation.py**: cross-shard conservation (sum of outbound corridor
+  accumulators equals sum of inbound, checked by the beacon at O(S) signed
+  objects per block, volume-independent), pending-set digests with aging
+  windows, O(f log C) bisection localization of faulty corridors, exact
+  IBLT decode of dangling transactions (drops and mints).
+- **hotstuff.py**: HotStuff-2 and Kauri baselines for the honest
+  comparison (Proxima's message advantage halves against HotStuff-2; v2's
+  1 KB digests trade bandwidth for message count, mitigated by the n = 128
+  light profile).
+- **test_v2.py** (41 checks) and **visualize_v2.py** (estimator collapse
+  and threshold figures, figures/figE1_*, figE2_*).
+
 ## Project Structure
 
 ```
