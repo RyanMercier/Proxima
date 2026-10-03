@@ -6,7 +6,8 @@ Single-slot Byzantine agreement among n replicas tolerating f Byzantine
 HotStuff-2:
 
   view v:  NEW-VIEW   every replica sends the leader its lock (highest
-                      prepare QC it holds) and its latest prepare vote
+                      prepare QC it holds) and its prepare-vote history
+                      (in a deployment: the votes cast since its lock)
            PROPOSE    leader proposes select(NV) if that is determined,
                       else any value; the proposal carries the NV set
            PREPARE    replicas vote iff the proposal equals select(NV)
@@ -19,14 +20,23 @@ n_fast = ceil((n + 3f + 1) / 2) prepare votes for one value, that set is
 itself a decision certificate (one voting round). This is the FaB / SBFT
 fast quorum; with n = 3f + 1 it is all n replicas. To stay safe, view
 change must recover a value that may have been fast-decided, so select()
-also accepts "at least n_fast - 2f prepare votes for x in the highest
-view that has any evidence". Proof sketch: a fast decision on x in view w
-puts >= n_fast - f honest votes on x; any n - f NEW-VIEW set keeps
->= n_fast - 2f of them, while y can collect at most f (Byzantine claims)
-+ (n - n_fast) (honest votes elsewhere) < n_fast - 2f claims. By
-induction no honest replica votes for y != x in a later view, so later
-views carry no evidence for y. A prepare QC and a fast certificate in the
-same view intersect in >= n_fast - f > f honest replicas, so they agree.
+scans views from highest to lowest and stops at the first view holding
+either a prepare QC or at least n_fast - 2f claimed prepare votes for one
+value. Proof sketch: a fast decision on x in view w puts >= n_fast - f
+honest votes on x; any n - f NEW-VIEW set keeps >= n_fast - 2f of them,
+while y can collect at most f (Byzantine claims) + (n - n_fast) (honest
+votes elsewhere) < n_fast - 2f claims in view w. By induction no honest
+replica votes for y != x in a later view, so later views hold no QC for y
+and at most f < n_fast - 2f claims for it. A prepare QC and a fast
+certificate in the same view intersect in >= n_fast - f > f honest
+replicas, so they agree.
+
+Replicas must report their vote HISTORY, not only their latest vote. With
+latest-vote-only reports the fuzzer found a violation at n = 6, f = 1:
+honest replicas kept voting x in later asynchronous views that each
+gathered too few votes to count, the view-w evidence was overwritten, and
+a later leader was free to propose y. FaB and SBFT carry the same
+information in their view-change messages.
 
 Setting n_fast = n - f (a single 2f + 1 round, the v1 design) breaks this:
 fuzz() finds conflicting decisions within a few hundred runs, and
@@ -70,7 +80,7 @@ class QC:
 class NewView:
     sender: int
     lock: Optional[QC]                       # genuine QC (unforgeable)
-    last_vote: Optional[Tuple[int, str]]     # (view, value) claimed
+    votes: Tuple[Tuple[int, str], ...] = ()  # claimed (view, value) prepare votes
 
 
 @dataclass
@@ -78,9 +88,13 @@ class Replica:
     rid: int
     byzantine: bool = False
     lock: Optional[QC] = None
-    last_vote: Optional[Tuple[int, str]] = None
+    votes: List[Tuple[int, str]] = field(default_factory=list)
     voted: Dict[Tuple[str, int], str] = field(default_factory=dict)
     decided: Optional[str] = None
+
+    @property
+    def last_vote(self):
+        return self.votes[-1] if self.votes else None
 
 
 def select_ev(nvs: List[NewView], n: int, f: int,
@@ -93,15 +107,15 @@ def select_ev(nvs: List[NewView], n: int, f: int,
     Views with claims below the threshold carry no evidence.
     """
     qcs = [nv.lock for nv in nvs if nv.lock is not None]
-    votes = [nv.last_vote for nv in nvs if nv.last_vote is not None]
-    views = sorted({q.view for q in qcs} | {w for w, _ in votes}, reverse=True)
+    claims = {(nv.sender, w, val) for nv in nvs for w, val in nv.votes}
+    views = sorted({q.view for q in qcs} | {w for _, w, _ in claims}, reverse=True)
     need = n_fast - 2 * f
     for w in views:
         in_view = [q for q in qcs if q.view == w]
         if in_view:
             return in_view[0].value, w
         counts: Dict[str, int] = {}
-        for vw, val in votes:
+        for _s, vw, val in claims:
             if vw == w:
                 counts[val] = counts.get(val, 0) + 1
         hits = [val for val, c in counts.items() if c >= need]
@@ -114,7 +128,7 @@ def select(nvs: List[NewView], n: int, f: int, n_fast: int) -> Optional[str]:
     return select_ev(nvs, n, f, n_fast)[0]
 
 
-def valid_nv_set(nvs: List[NewView], n: int, f: int, genuine: set) -> bool:
+def valid_nv_set(nvs: List[NewView], n: int, f: int, genuine: list) -> bool:
     senders = [nv.sender for nv in nvs]
     return (len(senders) >= quorum(n, f) and len(set(senders)) == len(senders)
             and all(nv.lock is None or nv.lock in genuine for nv in nvs))
@@ -132,7 +146,7 @@ class Run:
         self.reps = [Replica(i, i in byz) for i in range(n)]
         self.byz = set(byz)
         self.honest = [r for r in self.reps if not r.byzantine]
-        self.genuine: set = set()
+        self.genuine: list = []      # ordered, so runs are reproducible
         self.values = values
         self.msgs = 0
         self.fast_decisions = 0
@@ -166,10 +180,11 @@ class Run:
                 if r.byzantine:
                     # Lies about its vote; presents any genuine QC or none.
                     lock = self.rng.choice([None] + list(self.genuine))
-                    claim = (self.rng.randint(0, v - 1), self.rng.choice(self.values))
-                    nvs.append(NewView(r.rid, lock, claim))
+                    claims = tuple((self.rng.randint(0, v - 1), self.rng.choice(self.values))
+                                   for _ in range(self.rng.randint(0, 3)))
+                    nvs.append(NewView(r.rid, lock, claims))
                 else:
-                    nvs.append(NewView(r.rid, r.lock, r.last_vote))
+                    nvs.append(NewView(r.rid, r.lock, tuple(r.votes)))
             self.msgs += n
 
         # PROPOSE. Honest leader: picks a valid q-subset as the scheduler
@@ -212,7 +227,7 @@ class Run:
                         and w < r.lock.view):
                     continue                          # HotStuff locking rule
             r.voted[("prepare", v)] = val
-            r.last_vote = (v, val)
+            r.votes.append((v, val))
             prep.setdefault(val, set()).add(r.rid)
             self.msgs += 1
 
@@ -228,7 +243,8 @@ class Run:
                 self.msgs += n
             if len(seen) >= q:
                 qc = QC("prepare", v, val, frozenset(seen))
-                self.genuine.add(qc)
+                if qc not in self.genuine:
+                    self.genuine.append(qc)
                 commit = set(self.byz)
                 for r in self.subset(self.reps, 0, sync):
                     self.msgs += 1
@@ -308,9 +324,9 @@ def unsafe_fast_path_counterexample(f: int = 1) -> dict:
     y_honest, x_honest = honest[:f + 1], honest[f + 1:]
     unsafe_fast = n - f
     y_votes = len(byz) + len(y_honest)
-    nvs = ([NewView(i, None, (0, "x")) for i in byz]
-           + [NewView(i, None, (0, "x")) for i in x_honest]
-           + [NewView(y_honest[0], None, (0, "y"))])
+    nvs = ([NewView(i, None, ((0, "x"),)) for i in byz]
+           + [NewView(i, None, ((0, "x"),)) for i in x_honest]
+           + [NewView(y_honest[0], None, ((0, "y"),))])
     assert len(nvs) == n - f
     counts = {"x": 2 * f, "y": 1}
     # Any deterministic rule must follow the majority of claims here.

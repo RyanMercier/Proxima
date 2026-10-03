@@ -168,8 +168,10 @@ for nn in (4, 7, 10):
     fz = bft.fuzz(nn, 600, seed=nn)
     check(f"n={nn}: safe and live under 600 adversarial schedules",
           fz["unsafe"] == 0 and fz["not_live"] == 0, str(fz))
-fz = bft.fuzz(6, 600, seed=3, n_byz=1)
-check("n=6, f=1: fast quorum 5 < n is safe", fz["unsafe"] == 0 and fz["n_fast"] == 5, str(fz))
+fz = bft.fuzz(6, 2000, seed=6, n_byz=1)
+check("n=6, f=1: fast quorum 5 < n is safe (regression: latest-vote-only "
+      "NEW-VIEW failed trial 1736 of this seed)",
+      fz["unsafe"] == 0 and fz["n_fast"] == 5, str(fz))
 bad = bft.fuzz(4, 600, n_fast=3, seed=4)
 check("v1-style fast quorum 2f+1 is unsafe (fuzzer finds conflicts)", bad["unsafe"] > 0)
 ce = bft.unsafe_fast_path_counterexample(2)
