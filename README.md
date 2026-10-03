@@ -6,6 +6,30 @@ Every BFT consensus protocol uses collision-resistant hashes to compare validato
 
 Proxima replaces collision-resistant hashes with distance-preserving transaction digests. SHA-512 output is split into 8 segments, summed across transactions, producing an 8D vector where Euclidean distance is proportional to disagreement. This single primitive removes all three constraints: agreement is measurable in one round, tree groups need only 10 validators (vs Ethereum's 128), and cross-shard consistency costs 128 bytes per shard pair instead of per-transaction coordination.
 
+## Corrections (October 2026)
+
+This branch is the artifact for the BLOCKCHAIN'26 paper as published. A later
+audit, documented in the journal version on branch
+[`v2`](https://github.com/RyanMercier/Proxima/tree/v2), found errors that
+affect claims below:
+
+1. **The one-round fast path is unsafe across view changes.** Finalizing on
+   2N/3 speculative signatures in one round can let two honest validators
+   decide different blocks once a leader change occurs. The safe one-round
+   quorum is `ceil((n+3f+1)/2)` (all n at n = 3f+1), with view-change
+   messages carrying vote histories; see `bft.py` on `v2`.
+2. **The liveness bound** `exp(-0.22N)` ignores Byzantine abstainers and is
+   wrong near f = N/3.
+3. **The message and latency comparisons** below count Proxima and HotStuff
+   differently (certificate delivery, retransmission costs, no chained
+   HotStuff). Under one cost model there is no message advantage over
+   HotStuff-2.
+4. **Tree mode never had a Byzantine leaf leader** because Byzantine
+   validators were placed last.
+
+The code here is kept unchanged so the published numbers stay reproducible.
+Use branch `v2` for anything beyond reproducing the paper.
+
 ## Project Structure
 
 ```
