@@ -2,9 +2,10 @@
 """Byzantine strategy checks for the flat protocol (assertions, not prints).
 
 Each strategy runs with 20 txs and no partial observation so the Byzantine
-effect is isolated. Large-deviation strategies must be excluded by the
-distance filter; small-deviation ones may sit inside the cluster, which is
-harmless because finality needs valid signatures on the proposal's hash.
+effect is isolated. Large-deviation sketches must be flagged against D(B);
+small-deviation ones may pass unflagged, which is harmless because flags
+are observability only and finality needs valid signatures on H(B).
+("excluded" in the result dict is the historical name for flagged.)
 Run: python test_byzantine.py
 """
 

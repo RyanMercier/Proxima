@@ -1,21 +1,22 @@
 """
-blockchain.py -- Core protocol implementation (v2).
+blockchain.py -- Ledger, validators, and consensus accounting (v2).
 
-Distance-preserving multiset hashes (dpmh.py: zero-mean Rademacher digests,
-n = 512, two domains), IBLT set reconciliation replacing bloom filters
-(reconcile.py), BLS aggregate signatures, and the two-phase consensus with
-the speculative fast path. v2 protocol changes over the camera-ready:
+Consensus is the base protocol in bft.py (two voting phases with locking
+and view change) plus Proxima's augmentations; this module accounts its
+messages and bytes on a concrete chain and hosts the observability tools:
 
-- Closed-form clustering threshold tau^2 = 3n (Monte Carlo calibration is
-  demoted to validation).
-- Byzantine-robust reference: coordinate-wise median of the submitted
-  Phase 1 digests instead of the aggregator's own state.
-- Honest-sufficient fast-path trigger: >= 2N/3 matching commitments, no
-  variance gate (one in-cluster Byzantine can no longer grief the fast path).
-- Straggler sync via estimate-then-decode (digest distance sizes an IBLT,
-  which recovers exactly the missing transactions; no false positives).
-- Cumulative ledger accumulators per chain for O(log H) fork localization.
-- Readiness sensing and partition healing helpers (end of file).
+- Sketches (dpmh.py) on prepare votes report who is behind and by how
+  much against D(B), the sketch of the proposal. They never gate votes.
+- Speculative fast path at the FaB/SBFT quorum ceil((n + 3f + 1) / 2):
+  one voting round when that many validators are ready. Its trigger is a
+  signature count, so a Byzantine sketch cannot suppress it; Byzantine
+  abstention can, as for every one-round protocol.
+- Stragglers fetch missing transactions by id; they rejoin the vote.
+- Readiness sensing: gossiped sketches tell the proposer when the
+  mempool has converged on a candidate block.
+- Partition healing: bimodal sketch clouds, estimate-then-decode repair.
+- Ledger accumulators (LtHash + sketch) for range digests, O(log H) fork
+  localization, and prune accounting.
 """
 
 import hashlib
@@ -25,7 +26,6 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Set, Optional, Tuple
 
 import numpy as np
-from bitarray import bitarray
 
 import dpmh
 import reconcile
@@ -55,6 +55,17 @@ except ImportError:
 USE_REAL_BLS = True
 
 class BLSKeyPair:
+    """BLS12-381 keys via py-ecc, or a hash-based mock of the same sizes.
+
+    The mock is verifiable: a signature is SHA-384(pubkey || msg) and an
+    aggregate is SHA-384 over the signatures in signer order, so verify()
+    and verify_aggregate() recompute from public keys and reject a
+    signature on any other message (equivocation). It is not unforgeable;
+    it exists to keep large simulations fast while still exercising the
+    verification path. tests run real BLS at small N.
+
+    Private keys are sequential small integers: a demo, not key management.
+    """
     _counter = 1
 
     def __init__(self, name=None):
@@ -69,8 +80,13 @@ class BLSKeyPair:
     def sign(self, msg: bytes) -> bytes:
         if BLS_AVAILABLE and USE_REAL_BLS:
             return bls.Sign(self.privkey, msg)
-        # Mock: preserves 96-byte signature size for accurate bandwidth counting
-        return hashlib.sha384(f"{self.privkey}:{msg.hex()}".encode()).digest()
+        return hashlib.sha384(self.pubkey + msg).digest()
+
+    @staticmethod
+    def verify(pubkey: bytes, msg: bytes, sig: bytes) -> bool:
+        if BLS_AVAILABLE and USE_REAL_BLS:
+            return bls.Verify(pubkey, msg, sig)
+        return sig == hashlib.sha384(pubkey + msg).digest()
 
     @staticmethod
     def aggregate(signatures: list) -> bytes:
@@ -79,86 +95,46 @@ class BLSKeyPair:
         return hashlib.sha384(b"agg:" + b"".join(signatures)).digest()
 
     @staticmethod
-    def verify_aggregate(pubkeys: list, msg: bytes, agg_sig: bytes) -> bool:
+    def verify_aggregate(pubkeys: list, msg: bytes, agg_sig: bytes,
+                         sigs: list = None) -> bool:
         if BLS_AVAILABLE and USE_REAL_BLS:
             return bls.FastAggregateVerify(pubkeys, msg, agg_sig)
-        return True
+        expect = [hashlib.sha384(pk + msg).digest() for pk in pubkeys]
+        return agg_sig == hashlib.sha384(b"agg:" + b"".join(expect)).digest()
 
 
 # ---------------------------------------------------------------------------
-# Bloom filter
+# Transaction sketches
 # ---------------------------------------------------------------------------
 
-class BloomFilter:
-    """Probabilistic set membership test. About 25 bytes for 20 txs at 1% FP rate."""
-
-    def __init__(self, n_items: int = 50, fp_rate: float = 0.01):
-        self.size = max(8, int(-n_items * math.log(fp_rate) / (math.log(2) ** 2)))
-        self.n_hashes = max(1, int(self.size / max(n_items, 1) * math.log(2)))
-        self.bits = bitarray(self.size)
-        self.bits.setall(0)
-
-    def add(self, item: str):
-        for i in range(self.n_hashes):
-            h = int(hashlib.md5(f"{i}:{item}".encode()).hexdigest(), 16) % self.size
-            self.bits[h] = 1
-
-    def contains(self, item: str) -> bool:
-        for i in range(self.n_hashes):
-            h = int(hashlib.md5(f"{i}:{item}".encode()).hexdigest(), 16) % self.size
-            if not self.bits[h]:
-                return False
-        return True
-
-    @property
-    def size_bytes(self) -> int:
-        return len(self.bits.tobytes())
-
-    def missing_from(self, full_set: list) -> list:
-        return [item for item in full_set if not self.contains(item)]
+def tx_to_vector(tx_data: str, salt=0) -> np.ndarray:
+    """Rademacher vector of one transaction (round domain)."""
+    return dpmh.tx_vector(tx_data, salt)
 
 
-# ---------------------------------------------------------------------------
-# Transaction vector encoding
-# ---------------------------------------------------------------------------
+def compute_vector(tx_list: list, salt=0) -> np.ndarray:
+    """Integer sketch of a transaction set (round domain)."""
+    return dpmh.digest(tx_list, salt)
 
-def tx_to_vector(tx_data: str, height: int = 0) -> np.ndarray:
-    """Rademacher vector in {-1,+1}^n, salted by round height (dpmh)."""
-    return dpmh.tx_vector(tx_data, height)
 
-def compute_vector(tx_list: list, height: int = 0) -> np.ndarray:
-    """Commutative integer sum of transaction vectors (round domain)."""
-    if not tx_list:
-        return np.zeros(N_DIMS, dtype=np.int64)
-    return dpmh.digest(tx_list, height)
-
-def calibrate_threshold(txs: list = None, max_miss: int = 2,
-                        percentile: int = 99, margin: float = 1.2) -> float:
-    """v2: the threshold is closed form, tau = sqrt(3n).
-
-    E||dD||^2 = n d for d missing transactions, so tau^2 = 3n admits honest
-    stragglers (d <= max_miss = 2) except with probability exp(-n/8) and
-    excludes d >= 4 fabrications. The arguments are kept for call-site
-    compatibility; nothing is sampled. Monte Carlo lives on only as
-    validation (validate_threshold below, dpmh.validate_estimator).
-    """
+def calibrate_threshold(txs: list = None, *args, **kwargs) -> float:
+    """tau = sqrt(3n), closed form (arguments kept for old call sites)."""
     return dpmh.tau()
 
+
 def validate_threshold(txs: list, max_miss: int = 2, trials: int = 2000,
-                       height: int = 0) -> dict:
-    """Monte Carlo validation of the closed-form threshold (not protocol)."""
-    honest = compute_vector(txs, height)
-    tau2 = dpmh.tau2()
+                       salt=0, seed: int = 0) -> dict:
+    """Monte Carlo check of the closed-form threshold (not protocol)."""
+    rng = np.random.default_rng(seed)
+    honest = compute_vector(txs, salt)
     exceed = 0
     for _ in range(trials):
-        n_miss = np.random.randint(1, max_miss + 1)
-        missing = set(np.random.choice(len(txs), size=min(n_miss, len(txs)),
-                                       replace=False))
-        partial = [tx for j, tx in enumerate(txs) if j not in missing]
-        if dpmh.dist2(compute_vector(partial, height), honest) > tau2:
-            exceed += 1
-    return {"trials": trials, "exceed": exceed,
-            "rate": exceed / trials, "bound": math.exp(-dpmh.N_ROUND / 8)}
+        k = int(rng.integers(1, max_miss + 1))
+        drop = set(rng.choice(len(txs), size=min(k, len(txs)), replace=False).tolist())
+        partial = [tx for j, tx in enumerate(txs) if j not in drop]
+        exceed += dpmh.dist2(compute_vector(partial, salt), honest) > dpmh.tau2()
+    return {"trials": trials, "exceed": exceed, "rate": exceed / trials,
+            "bound": math.exp(-dpmh.N_ROUND / 8)}
 
 
 # ---------------------------------------------------------------------------
@@ -166,14 +142,21 @@ def validate_threshold(txs: list, max_miss: int = 2, trials: int = 2000,
 # ---------------------------------------------------------------------------
 
 class MessageCounter:
+    """Counts messages and bytes; leader_in tracks bytes arriving at the
+    leader or aggregator, the per-node bottleneck of leader-based BFT."""
+
     def __init__(self):
         self.count = 0
         self.bytes = 0
+        self.leader_in = 0
         self.by_type: Dict[str, int] = {}
 
-    def send(self, msg_type: str, size_bytes: int, n: int = 1):
+    def send(self, msg_type: str, size_bytes: int, n: int = 1,
+             to_leader: bool = False):
         self.count += n
         self.bytes += size_bytes * n
+        if to_leader:
+            self.leader_in += size_bytes * n
         self.by_type[msg_type] = self.by_type.get(msg_type, 0) + n
 
 
@@ -351,7 +334,9 @@ class State:
 # Validator
 # ---------------------------------------------------------------------------
 
-BYZANTINE_STRATEGIES = ["drop_half", "random_vector", "replace_one_tx", "mimic_honest", "coalition"]
+BYZANTINE_STRATEGIES = ["drop_half", "random_vector", "replace_one_tx",
+                        "mimic_honest", "coalition", "equivocate", "abstain"]
+
 
 class Validator:
     def __init__(self, vid: int, keypair: BLSKeyPair,
@@ -366,50 +351,34 @@ class Validator:
         return self.kp.name
 
     def get_vector(self, block: Block, missing: Optional[Set[int]] = None) -> np.ndarray:
+        """Sketch of this validator's view of the block (round domain)."""
+        salt = dpmh.round_salt(block.height, block.prev_hash)
         if self.is_byzantine:
-            return self._byzantine_vector(block)
+            return self._byzantine_vector(block, salt)
         strs = block.tx_data_strings
         if missing:
             strs = [s for i, s in enumerate(strs) if i not in missing]
-        return compute_vector(strs, block.height)
+        return compute_vector(strs, salt)
 
-    def make_bloom(self, block: Block, missing: Optional[Set[int]] = None) -> BloomFilter:
+    def _byzantine_vector(self, block: Block, salt) -> np.ndarray:
         strs = block.tx_data_strings
-        bf = BloomFilter(max(len(strs), 1))
-        for i, s in enumerate(strs):
-            if missing and i in missing:
-                continue
-            bf.add(s)
-        return bf
-
-    def _byzantine_vector(self, block: Block) -> np.ndarray:
-        strs = block.tx_data_strings
-        h = block.height
-        if not strs:
-            return np.random.randint(-8, 9, size=N_DIMS).astype(np.int64)
-        if self.strategy == "drop_half":
-            return compute_vector(strs[::2], h)
-        elif self.strategy == "random_vector":
-            # Fabricated state: random integer digest at block scale.
+        rng = np.random.default_rng(self.id * 7919 + block.height)
+        if not strs or self.strategy == "random_vector":
             scale = max(len(strs), 1)
-            return np.random.randint(-scale, scale + 1,
-                                     size=N_DIMS).astype(np.int64)
-        elif self.strategy == "replace_one_tx":
+            return rng.integers(-scale, scale + 1, size=N_DIMS).astype(np.int64)
+        if self.strategy == "drop_half":
+            return compute_vector(strs[::2], salt)
+        if self.strategy == "replace_one_tx":
             m = list(strs)
             m[min(1, len(m) - 1)] = hashlib.sha256(b"FRAUD").hexdigest()
-            return compute_vector(m, h)
-        elif self.strategy == "mimic_honest":
+            return compute_vector(m, salt)
+        if self.strategy == "mimic_honest":
             m = list(strs)
             m[0] = hashlib.sha256(b"SLIGHT").hexdigest()
-            return compute_vector(m, h)
-        elif self.strategy == "coalition":
-            return compute_vector(strs[:len(strs) // 2], h)
-        return compute_vector(strs, h)
-
-    def sign_commit(self, block_hash: str) -> Optional[bytes]:
-        if self.is_byzantine:
-            return None
-        return self.kp.sign(block_hash.encode())
+            return compute_vector(m, salt)
+        if self.strategy == "coalition":
+            return compute_vector(strs[:len(strs) // 2], salt)
+        return compute_vector(strs, salt)       # equivocate, abstain
 
     def to_dict(self) -> dict:
         d = {"id": self.id, "name": self.name, "byzantine": self.is_byzantine}
@@ -419,435 +388,304 @@ class Validator:
 
 
 # ---------------------------------------------------------------------------
-# Two-phase consensus
+# Consensus accounting (one height, one view with an honest leader)
 # ---------------------------------------------------------------------------
+#
+# The protocol is bft.py's: two voting phases with locking (prepare QC,
+# commit QC) and view change, plus the speculative fast path at the
+# FaB/SBFT quorum n_fast = ceil((n + 3f + 1) / 2). bft.py fuzzes safety
+# under equivocation and adversarial scheduling; the functions below
+# account messages and bytes for the common case of an honest leader after
+# GST, which is what the scaling comparison measures.
+#
+# What the sketch does here. Inside consensus the reference is D(B), the
+# sketch of the proposal, which anyone can compute from the block, so no
+# party has discretion over it. A validator that holds the proposal knows
+# exactly which transaction ids it lacks and fetches them by id. The sketch
+# on each prepare vote is observability: it tells the aggregator who was
+# behind, by roughly how much, and whether the cloud is bimodal (partition),
+# without shipping id lists. It never gates a vote or a certificate.
 
-def vector_consensus(validators: list, block: Block, threshold: float,
-                     partial_obs: Optional[dict] = None) -> dict:
+FETCH_REQ_BYTES = 32          # per missing transaction id requested
+TX_BYTES = 200                # transaction body
+VOTE_BYTES = 96 + 32          # BLS signature + block hash / view metadata
+SAFETY_F = None               # default: bft.max_faults(n)
+# Byzantine strategies that put a signature on the wire: equivocate (on a
+# conflicting message) or sign correctly while lying in the sketch.
+SIGNING_STRATEGIES = {"equivocate", "mimic_honest", "replace_one_tx"}
+
+
+def fetch_bytes(k: int) -> int:
+    """Request k ids and receive k bodies (shared with the baselines)."""
+    return k * (FETCH_REQ_BYTES + TX_BYTES)
+
+
+def _cert_bytes(n: int, qc: str = "bitmap") -> int:
+    """Certificate: aggregate signature plus signer bitmap, or a constant
+    threshold signature."""
+    return 96 + (math.ceil(n / 8) if qc == "bitmap" else 0) + 64
+
+
+def _sign_or_none(v, msg: bytes, phase: str):
+    """A validator's signature on msg for this phase, or None.
+
+    Byzantine behaviours: "equivocate" signs a different message (rejected
+    at verification), "mimic_honest" and "replace_one_tx" sign correctly
+    (only their sketches lie), every other strategy abstains.
     """
-    Run two-phase consensus on a proposed block (v2 protocol).
+    if not v.is_byzantine:
+        return v.kp.sign(msg)
+    if v.strategy == "equivocate":
+        return v.kp.sign(msg + b"|conflict")
+    if v.strategy in SIGNING_STRATEGIES:
+        return v.kp.sign(msg)
+    return None
 
-    Phase 1: each validator sends its digest (n=512 Rademacher, 1024 B) to
-    the aggregator; a validator whose local state matches the proposal also
-    attaches a speculative BLS commitment on the block hash (96 bytes). The
-    aggregator forms a Byzantine-robust reference (coordinate-wise median
-    of the submitted digests), clusters by integer squared distance against
-    tau^2 = 3n, and synchronizes stragglers by estimate-then-decode: the
-    digest distance sizes an IBLT, which recovers exactly the missing
-    transactions (no blooms, no false positives).
 
-    Fast path (honest-sufficient trigger): with >= 2N/3 commitments on the
-    same hash, the aggregator aggregates them and multicasts the finality
-    certificate in one round. The certificate is the same object Phase 2
-    produces: 96-byte aggregate + N/8-byte signer bitmap. No variance gate:
-    a near-threshold Byzantine cannot block the trigger, because the honest
-    2N/3 all match below the corruption bound.
+def _n_senders(validators) -> int:
+    """Validators that put a vote on the wire (valid or not)."""
+    return sum(1 for v in validators
+               if not v.is_byzantine or v.strategy in SIGNING_STRATEGIES)
 
-    Phase 2 (fallback): cluster members send BLS-signed commits. Aggregator
-    produces an aggregate signature + signer bitmap and multicasts the
-    finality proof. Commitments already received in Phase 1 could be reused
-    here; the accounting conservatively re-collects from the full cluster.
+
+def _collect(validators, msg: bytes, voters, phase: str):
+    """Collect and verify signatures; return (valid signer ids, agg sig)."""
+    sigs, pubs, ids = [], [], []
+    for v in voters:
+        s = _sign_or_none(v, msg, phase)
+        if s is None:
+            continue
+        if not BLSKeyPair.verify(v.kp.pubkey, msg, s):
+            continue                      # equivocation or garbage: dropped
+        sigs.append(s)
+        pubs.append(v.kp.pubkey)
+        ids.append(v.id)
+    agg = BLSKeyPair.aggregate(sigs) if sigs else None
+    if agg is not None:
+        assert BLSKeyPair.verify_aggregate(pubs, msg, agg, sigs)
+    return ids, agg
+
+
+def vector_consensus(validators: list, block: Block, threshold: float = None,
+                     partial_obs: Optional[dict] = None, f: int = SAFETY_F,
+                     qc: str = "bitmap", observe: bool = True) -> dict:
+    """Flat Proxima on the base protocol: one view, honest leader.
+
+    Round 1 (PREPARE): the leader multicasts the proposal (tx ids); each
+    validator replies with a prepare signature on H(B) and, if observe,
+    the sketch of its own view of B. Validators with the full block vote
+    at once; stragglers fetch their missing ids from the leader first and
+    vote late. If n_fast valid prepare signatures arrive on time, they are
+    the decision certificate (fast path). Otherwise the leader waits for
+    stragglers, forms the prepare QC (n - f), and the commit phase follows
+    (commit QC, n - f). The certificate is delivered to all N validators.
     """
+    import bft
     t0 = time.time()
     msgs = MessageCounter()
     n = len(validators)
-    n_req = int(math.ceil(n * 2 / 3))
-    all_tx_strs = block.tx_data_strings
-    tau2 = int(round(threshold * threshold))   # integer decision threshold
+    f = bft.max_faults(n) if f is None else f
+    q, n_fast = bft.quorum(n, f), bft.fast_quorum(n, f)
+    partial_obs = partial_obs or {}
+    salt = dpmh.round_salt(block.height, block.prev_hash)
+    ref = dpmh.digest(block.tx_data_strings, salt)
+    tau2 = dpmh.tau2()
+    h = block.block_hash.encode()
 
-    # Phase 1: validators send digest (+ conditional commitment).
-    vectors = {}
-    p1_sigs = []
-    p1_signer_ids = []
-    for v in validators:
-        miss = partial_obs.get(v.id, set()) if partial_obs else set()
-        vectors[v.id] = v.get_vector(block, miss)
-        commit_size = 0
-        if not v.is_byzantine and not miss:
-            sig = v.sign_commit(block.block_hash)
-            if sig is not None:
-                p1_sigs.append(sig)
-                p1_signer_ids.append(v.id)
-                commit_size = 96
-        msgs.send("phase1_vector", DIGEST_WIRE + commit_size)
+    # Proposal to everyone.
+    msgs.send("propose", 64 + 32 * len(block.transactions), n)
 
-    # Byzantine-robust reference: coordinate-wise median of what was
-    # actually submitted (breakdown 1/2 per coordinate), verifiable by any
-    # validator from the signed Phase 1 digests. The aggregator's own state
-    # is no longer a manipulation point.
-    reference = dpmh.robust_reference([vectors[v.id] for v in validators])
-
-    cluster = []
-    excluded = []
-    distances = {}
-    dist2s = {}
-    for v in validators:
-        d2 = dpmh.dist2(vectors[v.id], reference)
-        dist2s[v.id] = d2
-        distances[v.id] = math.sqrt(d2)       # float, reporting only
-        if d2 <= tau2:
-            cluster.append(v)
-        else:
-            excluded.append(v)
-
-    # Straggler sync, estimate-then-decode: d_hat = dist2/n sizes an IBLT;
-    # the decode identifies exactly the missing transactions, which the
-    # aggregator then pushes. Wire cost: one sketch + the pushed payloads.
-    sync_pushed = 0
+    # Stragglers fetch missing ids before voting.
+    stragglers = [v for v in validators
+                  if not v.is_byzantine and partial_obs.get(v.id)]
     sync_details = []
-    if partial_obs:
-        for v in cluster:
-            if v.is_byzantine or v.id not in partial_obs:
-                continue
-            missing = partial_obs.get(v.id, set())
-            if not missing:
-                continue
-            d_hat = max(1, round(dist2s[v.id] / N_DIMS))
-            msgs.send("sync_iblt", reconcile.sync_cost(d_hat))
-            sync_pushed += len(missing)
-            sync_details.append((v.name, len(missing)))
-            msgs.send("sync_push", len(missing) * 200)
+    for v in stragglers:
+        k = len(partial_obs[v.id])
+        msgs.send("fetch_by_id", fetch_bytes(k))
+        sync_details.append((v.name, k))
 
-    # Cluster assignment broadcast (multicast to cluster members)
-    for _ in cluster:
-        msgs.send("phase1_cluster", 16)
+    # Observability sketches ride on prepare votes (pre-fetch view).
+    distances, flagged = {}, []
+    if observe:
+        for v in validators:
+            d2 = dpmh.dist2(v.get_vector(block, partial_obs.get(v.id)), ref)
+            distances[v.id] = math.sqrt(d2)
+            if d2 > tau2:
+                flagged.append(v)
+    sketch = DIGEST_WIRE if observe else 0
 
-    phase1_time = time.time() - t0
-    cluster_variance = float(np.var([distances[v.id] for v in cluster])) if cluster else 999.0
+    on_time = [v for v in validators if v not in stragglers]
+    p_on_time, agg = _collect(validators, b"prepare:" + h, on_time, "prepare")
+    p_late, _ = _collect(validators, b"prepare:" + h, stragglers, "prepare")
+    msgs.send("prepare_vote", VOTE_BYTES + sketch, _n_senders(validators),
+              to_leader=True)
 
-    # Fast path: honest-sufficient trigger. Fire iff >= 2N/3 valid
-    # commitments on the same hash arrived in round one. No global
-    # statistic (variance) is consulted, so no adversary below the
-    # corruption bound can suppress an otherwise-ready fast path.
-    fast_path = len(p1_sigs) >= n_req
-
-    if fast_path:
-        # Single-round finality: aggregate the Phase 1 commitments into the
-        # same certificate object Phase 2 produces (aggregate + bitmap).
-        agg_sig = BLSKeyPair.aggregate(p1_sigs)
-        fp_bitmap = bitarray(n)
-        fp_bitmap.setall(0)
-        for vid in p1_signer_ids:
-            fp_bitmap[vid] = 1
-        finality_proof_size = 96 + len(fp_bitmap.tobytes())
-        for _ in cluster:
-            msgs.send("fast_path_finality", finality_proof_size)
-        total_time = time.time() - t0
-        return {
-            "finalized": True,
-            "fast_path": True,
-            "cluster_size": len(cluster),
-            "excluded": [(v.name, v.is_byzantine, v.strategy if v.is_byzantine else None,
-                          distances[v.id]) for v in excluded],
-            "cluster_variance": cluster_variance,
-            "phase1_time": phase1_time,
-            "phase2_time": 0.0,
-            "total_time": total_time,
-            "msgs": msgs.count,
-            "msg_bytes": msgs.bytes,
-            "msg_breakdown": dict(msgs.by_type),
-            "sync_pushed": sync_pushed,
-            "sync_details": sync_details,
-            "n_commits": len(p1_sigs),
-            "n_required": n_req,
-            "finality_proof_bytes": finality_proof_size,
-            "distances": {v.name: distances[v.id] for v in validators},
-        }
-
-    # Phase 2: BLS commitments within cluster
-    t1 = time.time()
-    sigs = []
-    pubs = []
-    signer_bitmap = bitarray(n)
-    signer_bitmap.setall(0)
-
-    for v in cluster:
-        sig = v.sign_commit(block.block_hash)
-        if sig is not None:
-            sigs.append(sig)
-            pubs.append(v.kp.pubkey)
-            signer_bitmap[v.id] = 1
-            msgs.send("phase2_commit", 96)
-
-    finality_proof_size = 0
-    if sigs:
-        agg_sig = BLSKeyPair.aggregate(sigs)
-        bitmap_bytes = len(signer_bitmap.tobytes())
-        finality_proof_size = 96 + bitmap_bytes
-        # Multicast finality proof to cluster members
-        for _ in cluster:
-            msgs.send("phase2_finality", finality_proof_size)
-
-    phase2_time = time.time() - t1
-    total_time = time.time() - t0
-    finalized = len(sigs) >= n_req
+    fast = len(p_on_time) >= n_fast
+    cert = _cert_bytes(n, qc)
+    if fast:
+        msgs.send("fast_certificate", cert, n)
+        n_commits, rounds = len(p_on_time), 1
+        finalized = True
+    else:
+        prepared = p_on_time + p_late
+        if len(prepared) < q:
+            finalized, n_commits, rounds = False, len(prepared), 1
+        else:
+            msgs.send("prepare_qc", cert, n)
+            c_ids, _ = _collect(validators, b"commit:" + h, validators, "commit")
+            msgs.send("commit_vote", VOTE_BYTES, _n_senders(validators),
+                      to_leader=True)
+            finalized = len(c_ids) >= q
+            if finalized:
+                msgs.send("commit_qc", cert, n)
+            n_commits, rounds = len(c_ids), 2
 
     return {
         "finalized": finalized,
-        "fast_path": False,
-        "cluster_size": len(cluster),
-        "excluded": [(v.name, v.is_byzantine, v.strategy if v.is_byzantine else None,
-                      distances[v.id]) for v in excluded],
-        "cluster_variance": cluster_variance,
-        "phase1_time": phase1_time,
-        "phase2_time": phase2_time,
-        "total_time": total_time,
+        "fast_path": fast,
+        "rounds": rounds,
+        "f": f, "n_fast": n_fast, "quorum": q,
+        "cluster_size": n - len(flagged),
+        "excluded": [(v.name, v.is_byzantine,
+                      v.strategy if v.is_byzantine else None,
+                      distances.get(v.id, 0.0)) for v in flagged],
+        "cluster_variance": float(np.var(list(distances.values())))
+                            if distances else 0.0,
+        "total_time": time.time() - t0,
         "msgs": msgs.count,
         "msg_bytes": msgs.bytes,
+        "leader_in_bytes": msgs.leader_in,
         "msg_breakdown": dict(msgs.by_type),
-        "sync_pushed": sync_pushed,
+        "sync_pushed": sum(k for _, k in sync_details),
         "sync_details": sync_details,
-        "n_commits": len(sigs),
-        "n_required": n_req,
-        "finality_proof_bytes": finality_proof_size,
-        "distances": {v.name: distances[v.id] for v in validators},
+        "n_commits": n_commits,
+        "n_required": n_fast if fast else q,
+        "finality_proof_bytes": cert,
+        "distances": {v.name: distances.get(v.id, 0.0) for v in validators},
     }
 
 
-# ---------------------------------------------------------------------------
-# Tree-structured consensus
-# ---------------------------------------------------------------------------
+def _tree_shape(n_leaves: int, branching: int) -> list:
+    """Node counts per level, leaves first, root last: [c0, c1, ..., 1]."""
+    counts = [n_leaves]
+    while counts[-1] > 1:
+        counts.append(math.ceil(counts[-1] / branching))
+    return counts
 
-def tree_consensus(validators: list, block: Block, threshold: float,
-                   partial_obs: Optional[dict] = None,
-                   branching: int = 10) -> dict:
+
+def _tree_up(msgs, phase: str, leaves: list, counts: list, vote_bytes: int,
+             agg_bytes: int) -> int:
+    """Account one aggregation pass up the tree; returns fallback leaves.
+
+    Members send votes to their leaf leader; an honest leader forwards one
+    aggregate, a Byzantine leader drops the leaf and its members resend to
+    the root after a timeout. Level-i nodes send one aggregate each to
+    their parent; only the last hop lands at the root (leader ingress).
     """
-    Hierarchical two-phase consensus using a tree of aggregators.
+    single = len(counts) == 1
+    fallbacks = 0
+    for leaf in leaves:
+        msgs.send(f"{phase}_L0_vote", vote_bytes, len(leaf) - 1,
+                  to_leader=single)
+        if leaf[0].is_byzantine and not single:
+            fallbacks += 1
+            msgs.send(f"{phase}_fallback", vote_bytes, len(leaf) - 1,
+                      to_leader=True)
+    for i in range(len(counts) - 1):
+        sending = counts[i] - (fallbacks if i == 0 else 0)
+        msgs.send(f"{phase}_agg_L{i}", agg_bytes, sending,
+                  to_leader=(i == len(counts) - 2))
+    return fallbacks
 
-    Key insight: leaves do NOT run per-leaf BFT. The distance threshold
-    filters Byzantine validators individually. A leaf with 5 honest and
-    5 Byzantine just excludes the 5 Byzantine and reports the filtered
-    mean of the remaining 5. Phase 2 BLS commits catch any Byzantine
-    who slipped past the distance filter.
 
-    Phase 1 (bottom-up):
-      Level 0: validators send vector + bloom to leaf leader. Leaf leader
-      distance-filters, bloom-syncs, computes weighted mean, sends 76-byte
-      summary (mean + count + variance) upstream.
-      Level 1+: internal nodes aggregate child summaries into their own
-      76-byte summary and pass it up.
-      Root: checks global weighted mean distance from reference.
+def tree_consensus(validators: list, block: Block, threshold: float = None,
+                   partial_obs: Optional[dict] = None, branching: int = 10,
+                   f: int = SAFETY_F, qc: str = "bitmap",
+                   observe: bool = True) -> dict:
+    """Tree-routed Proxima: the same two phases, aggregated up a tree.
 
-    Phase 2 (top-down):
-      Root broadcasts "collect commits" down. Each validator that passed
-      the distance filter sends a BLS commit up through the tree. Internal
-      nodes aggregate BLS sigs from children (associative). Root checks
-      count >= 2/3.
+    Leaves of size `branching`; each leaf's first member is its leader, so
+    leaders inherit the random placement of Byzantine validators. BLS
+    aggregation is associative, so each node forwards one aggregate. A
+    Byzantine leaf leader drops its leaf; members resend to the root after
+    a timeout (Kauri-style fallback, counted). With observe, leaf leaders
+    also forward exact integer summaries: the sum of member sketches, the
+    member count, and the sum of squared distances to D(B).
     """
+    import bft
     t0 = time.time()
     msgs = MessageCounter()
     n = len(validators)
-    n_req = int(math.ceil(n * 2 / 3))
-    all_tx_strs = block.tx_data_strings
-    reference = compute_vector(all_tx_strs, block.height)
-    tau2 = int(round(threshold * threshold))
+    f = bft.max_faults(n) if f is None else f
+    q, n_fast = bft.quorum(n, f), bft.fast_quorum(n, f)
+    partial_obs = partial_obs or {}
+    salt = dpmh.round_salt(block.height, block.prev_hash)
+    ref = dpmh.digest(block.tx_data_strings, salt)
+    tau2 = dpmh.tau2()
+    h = block.block_hash.encode()
+    cert = _cert_bytes(n, qc)
+    agg = 96 + math.ceil(n / 8)
+    sketch = DIGEST_WIRE if observe else 0
 
-    # Build tree structure: split validators into leaf groups
-    leaf_groups = [validators[i:i + branching]
-                   for i in range(0, n, branching)]
-    n_leaves = len(leaf_groups)
+    leaves = [validators[i:i + branching] for i in range(0, n, branching)]
+    counts = _tree_shape(len(leaves), branching)
 
-    # Compute tree depth
-    n_levels = 1  # level 0 = leaves
-    nodes_at_level = n_leaves
-    while nodes_at_level > 1:
-        nodes_at_level = math.ceil(nodes_at_level / branching)
-        n_levels += 1
+    msgs.send("propose_down", 64 + 32 * len(block.transactions), n - 1)
+    stragglers = {v.id for v in validators
+                  if not v.is_byzantine and partial_obs.get(v.id)}
+    sync = 0
+    for vid in stragglers:
+        k = len(partial_obs[vid])
+        msgs.send("fetch_by_id", fetch_bytes(k))
+        sync += k
 
-    # ---- Phase 1: bottom-up ----
+    flagged, ssq = 0, 0
+    if observe:
+        for v in validators:
+            d2 = dpmh.dist2(v.get_vector(block, partial_obs.get(v.id)), ref)
+            ssq += d2
+            flagged += d2 > tau2
+    fb = _tree_up(msgs, "prepare", leaves, counts, VOTE_BYTES + sketch,
+                  agg + (SUMMARY_BYTES if observe else 0))
 
-    # Level 0: validators -> leaf leaders
-    passed_filter = set()  # validator ids that passed distance filter
-    leaf_summaries = []    # (weighted_mean, count, variance) per leaf
-    total_excluded = 0
-    total_sync = 0
-    level_stats = []
+    on_time = [v for v in validators if v.id not in stragglers]
+    late = [v for v in validators if v.id in stragglers]
+    p_on, _ = _collect(validators, b"prepare:" + h, on_time, "prepare")
+    p_late, _ = _collect(validators, b"prepare:" + h, late, "prepare")
+    fast = len(p_on) >= n_fast
+    if fast:
+        msgs.send("fast_certificate_down", cert, n - 1)
+        finalized, n_commits, rounds = True, len(p_on), 1
+    elif len(p_on) + len(p_late) < q:
+        finalized, n_commits, rounds = False, len(p_on) + len(p_late), 1
+    else:
+        msgs.send("prepare_qc_down", cert, n - 1)
+        c_ids, _ = _collect(validators, b"commit:" + h, validators, "commit")
+        _tree_up(msgs, "commit", leaves, counts, VOTE_BYTES, agg)
+        finalized = len(c_ids) >= q
+        if finalized:
+            msgs.send("commit_qc_down", cert, n - 1)
+        n_commits, rounds = len(c_ids), 2
 
-    for group in leaf_groups:
-        vectors = {}
-
-        for v in group:
-            miss = partial_obs.get(v.id, set()) if partial_obs else set()
-            vectors[v.id] = v.get_vector(block, miss)
-            msgs.send("L0_vector", DIGEST_WIRE)
-
-        # Distance filter against reference (not group mean)
-        included = []
-        included_vecs = []
-        for v in group:
-            d2 = dpmh.dist2(vectors[v.id], reference)
-            if d2 <= tau2:
-                included.append(v)
-                included_vecs.append(vectors[v.id])
-                passed_filter.add(v.id)
-            else:
-                total_excluded += 1
-
-        # Straggler sync: digest distance sizes an IBLT, the decode
-        # identifies the missing txs exactly, the leaf leader pushes them.
-        if partial_obs:
-            for v in included:
-                if v.is_byzantine or v.id not in partial_obs:
-                    continue
-                missing = partial_obs.get(v.id, set())
-                if missing:
-                    d_hat = max(1, round(
-                        dpmh.dist2(vectors[v.id], reference) / N_DIMS))
-                    msgs.send("L0_sync_iblt", reconcile.sync_cost(d_hat))
-                    total_sync += len(missing)
-                    msgs.send("L0_sync", len(missing) * 200)
-
-        # Leaf summary: weighted mean of included vectors
-        if included_vecs:
-            leaf_mean = np.mean(included_vecs, axis=0)
-            leaf_var = float(np.var([np.linalg.norm(
-                (v - reference).astype(np.float64))
-                for v in included_vecs]))
-            leaf_count = len(included)
-        else:
-            # All validators in this leaf were excluded
-            leaf_mean = np.zeros(N_DIMS)
-            leaf_var = 0.0
-            leaf_count = 0
-
-        leaf_summaries.append((leaf_mean, leaf_count, leaf_var))
-        # Leaf leader sends its exact summary upstream (digest sum encoded
-        # mod q + count + sum of squared distances).
-        msgs.send("L0_summary", SUMMARY_BYTES)
-
-    level_stats.append({
-        "level": 0,
-        "groups": n_leaves,
-        "excluded": total_excluded,
-        "passed": len(passed_filter),
-        "msgs": msgs.count,
-    })
-
-    # Level 1+: aggregate summaries up the tree
-    current_summaries = leaf_summaries
-    level = 1
-    while len(current_summaries) > 1:
-        next_summaries = []
-        level_groups = [current_summaries[i:i + branching]
-                        for i in range(0, len(current_summaries), branching)]
-
-        for group in level_groups:
-            total_count = sum(c for _, c, _ in group)
-            if total_count > 0:
-                agg_mean = np.sum(
-                    [mean * count for mean, count, _ in group], axis=0
-                ) / total_count
-                # Combined variance (weighted)
-                agg_var = sum(v * c for _, c, v in group) / total_count
-            else:
-                agg_mean = np.zeros(N_DIMS)
-                agg_var = 0.0
-
-            next_summaries.append((agg_mean, total_count, agg_var))
-            # Internal node sends its aggregated exact summary upstream
-            msgs.send(f"L{level}_summary", SUMMARY_BYTES)
-
-        level_stats.append({
-            "level": level,
-            "groups": len(level_groups),
-            "msgs_this_level": len(level_groups),
-        })
-        current_summaries = next_summaries
-        level += 1
-
-    # Root: check global weighted mean
-    root_mean, root_count, root_var = current_summaries[0]
-    global_dist = float(np.linalg.norm(
-        (root_mean - reference).astype(np.float64)))
-
-    phase1_time = time.time() - t0
-
-    # ---- Phase 2: top-down BLS commits ----
-
-    t1 = time.time()
-
-    # Root broadcasts "collect commits" down tree
-    # At each level, message goes to branching children
-    nodes_this_level = 1
-    for lv in range(n_levels - 1):
-        children = min(nodes_this_level * branching,
-                       math.ceil(n / (branching ** (n_levels - 1 - lv))))
-        msgs.send(f"P2_collect_L{lv}", 32, children)
-        nodes_this_level = children
-
-    # Each validator that passed filter sends BLS commit up
-    sigs = []
-    signer_bitmap = bitarray(n)
-    signer_bitmap.setall(0)
-
-    for v in validators:
-        if v.id not in passed_filter:
-            continue
-        sig = v.sign_commit(block.block_hash)
-        if sig is not None:
-            sigs.append(sig)
-            signer_bitmap[v.id] = 1
-            msgs.send("P2_commit", 96)
-
-    # Commits aggregate up through tree: each internal node receives
-    # commits from children, aggregates BLS sigs, sends one aggregate up.
-    # Cost: branching messages in per node, 1 out. Net at each level
-    # above leaves = number of internal nodes at that level.
-    agg_sig_size = 96 + math.ceil(n / 8)  # aggregate sig + bitmap
-    for lv in range(n_levels - 1):
-        # Number of internal nodes at this level
-        n_nodes = math.ceil(n_leaves / (branching ** (lv + 1)))
-        n_nodes = max(n_nodes, 1)
-        msgs.send(f"P2_agg_L{lv}", agg_sig_size, n_nodes)
-
-    # Root produces finality proof, broadcasts down tree
-    finality_proof_size = 96 + math.ceil(n / 8)
-    for lv in range(n_levels - 1):
-        n_nodes = math.ceil(n_leaves / (branching ** lv))
-        n_nodes = max(n_nodes, 1)
-        msgs.send(f"P2_finality_L{lv}", finality_proof_size, n_nodes)
-
-    # Leaf leaders forward finality proof to their validators
-    n_passed = len(passed_filter)
-    msgs.send("P2_finality_validators", finality_proof_size, n_passed)
-
-    phase2_time = time.time() - t1
-    total_time = time.time() - t0
-    finalized = len(sigs) >= n_req
-
-    if sigs:
-        BLSKeyPair.aggregate(sigs)
-
+    level_stats = [{"level": 0, "groups": len(leaves), "excluded": flagged,
+                    "passed": n - flagged, "fallback_leaves": fb}]
+    level_stats += [{"level": i, "groups": c, "msgs_this_level": c}
+                    for i, c in enumerate(counts[1:], start=1)]
     return {
-        "finalized": finalized,
-        "fast_path": False,  # tree mode does not use fast path
-        "tree_mode": True,
-        "cluster_size": len(passed_filter),
-        "excluded": [(v.name, v.is_byzantine,
-                      v.strategy if v.is_byzantine else None,
-                      float(np.linalg.norm(
-                          v.get_vector(block,
-                                       partial_obs.get(v.id, set()) if partial_obs else set())
-                          - reference)))
-                     for v in validators if v.id not in passed_filter],
-        "cluster_variance": root_var,
-        "global_dist": global_dist,
-        "phase1_time": phase1_time,
-        "phase2_time": phase2_time,
-        "total_time": total_time,
-        "msgs": msgs.count,
-        "msg_bytes": msgs.bytes,
+        "finalized": finalized, "fast_path": fast, "rounds": rounds,
+        "tree_mode": True, "f": f, "n_fast": n_fast, "quorum": q,
+        "cluster_size": n - flagged, "excluded": [],
+        "cluster_variance": ssq / n / N_DIMS,
+        "total_time": time.time() - t0,
+        "msgs": msgs.count, "msg_bytes": msgs.bytes,
+        "leader_in_bytes": msgs.leader_in,
         "msg_breakdown": dict(msgs.by_type),
-        "sync_pushed": total_sync,
-        "sync_details": [],
-        "n_commits": len(sigs),
-        "n_required": n_req,
-        "finality_proof_bytes": finality_proof_size,
-        "n_levels": n_levels,
-        "n_leaves": n_leaves,
-        "branching": branching,
-        "level_stats": level_stats,
-        "distances": {},  # skip per-validator distances for large N
+        "sync_pushed": sync, "sync_details": [],
+        "n_commits": n_commits, "n_required": n_fast if fast else q,
+        "finality_proof_bytes": cert,
+        "n_levels": len(counts), "n_leaves": len(leaves),
+        "branching": branching, "fallback_leaves": fb,
+        "level_stats": level_stats, "distances": {},
     }
 
 
@@ -932,11 +770,19 @@ class Blockchain:
         cb = CoinbaseTx(addr, block_reward(self.height), self.height,
                         receiver_name=proposer.name)
         cb.compute_hash()
-        txs = [cb] + list(self.mempool)
+        seen, txs = set(), [cb]
+        for tx in self.mempool:                 # a block is a set (MU_MAX)
+            if tx.data_str not in seen:
+                seen.add(tx.data_str)
+                txs.append(tx)
         return Block(self.height, self.tip, txs, self.clock(), addr,
                      proposer_name=proposer.name)
 
     def finalize_block(self, block: Block) -> bool:
+        try:
+            dpmh.assert_set(block.tx_data_strings)
+        except ValueError:
+            return False
         snap = self.state.snapshot()
         fees = 0.0
         for tx in block.transactions:
@@ -1008,27 +854,48 @@ class Blockchain:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def make_validators(n_honest: int, n_byz: int = 0,
-                    strategy: str = "drop_half") -> Tuple[list, list, list]:
+def make_validators(n_honest: int, n_byz: int = 0, strategy: str = "drop_half",
+                    seed: int = 0, shuffle: bool = True) -> Tuple[list, list, list]:
+    """Validators with Byzantine members at random positions.
+
+    Position matters: tree leaves are contiguous slices and a leaf's first
+    member is its leader, so placing Byzantine validators at the end (as
+    v1 did) would hide Byzantine leaf leaders entirely. ids equal list
+    positions. The first honest validator in the returned honest list is
+    the default proposer.
+    """
     BLSKeyPair._counter = 1
-    honest = [Validator(i, BLSKeyPair(f"Miner-{i}")) for i in range(n_honest)]
-    byzantine = [
-        Validator(i + n_honest, BLSKeyPair(f"Byz-{i}"), True, strategy)
-        for i in range(n_byz)
-    ]
-    return honest + byzantine, honest, byzantine
+    roles = [False] * n_honest + [True] * n_byz
+    if shuffle:
+        np.random.default_rng(seed).shuffle(roles)
+    out, h_i, b_i = [], 0, 0
+    for pos, is_b in enumerate(roles):
+        if is_b:
+            out.append(Validator(pos, BLSKeyPair(f"Byz-{b_i}"), True, strategy))
+            b_i += 1
+        else:
+            out.append(Validator(pos, BLSKeyPair(f"Miner-{h_i}")))
+            h_i += 1
+    honest = [v for v in out if not v.is_byzantine]
+    byzantine = [v for v in out if v.is_byzantine]
+    return out, honest, byzantine
 
 
-def make_partial_obs(validators: list, n_txs: int,
-                     max_miss: int = 2, miss_prob: float = 0.37) -> dict:
-    """Simulate network delay: some honest validators miss 1-2 txs."""
+def make_partial_obs(validators: list, n_txs: int, max_miss: int = 2,
+                     miss_prob: float = 0.37, rng=None) -> dict:
+    """Some honest validators have not yet received 1..max_miss of the
+    block's transactions when the proposal arrives. miss_prob is a model
+    parameter (swept in the evaluation), not a measured constant."""
+    # Default draws from the global numpy seed so np.random.seed() pins it.
+    rng = rng or np.random.default_rng(np.random.randint(2 ** 31))
     obs = {}
     for v in validators:
         if v.is_byzantine:
             continue
-        if np.random.random() < miss_prob:
-            n_miss = np.random.randint(1, max_miss + 1)
-            obs[v.id] = set(np.random.choice(n_txs, size=min(n_miss, n_txs), replace=False))
+        if rng.random() < miss_prob:
+            k = int(rng.integers(1, max_miss + 1))
+            obs[v.id] = set(rng.choice(n_txs, size=min(k, n_txs),
+                                       replace=False).tolist())
     return obs
 
 
@@ -1036,47 +903,62 @@ def make_partial_obs(validators: list, n_txs: int,
 # v2: readiness sensing (sense, then propose)
 # ---------------------------------------------------------------------------
 
-def readiness_sense(validators: list, block: Block, threshold: float,
-                    initial_obs: dict, fill_prob: float = 0.5,
-                    quorum_margin: int = 0, max_ticks: int = 20) -> dict:
-    """Sense the digest cloud and propose only when it has converged.
+def _gossip_tick(obs: dict, fill_prob: float, rng) -> dict:
+    """One gossip interval: each missing tx arrives with prob fill_prob."""
+    out = {}
+    for vid, miss in obs.items():
+        rest = {i for i in miss if rng.random() >= fill_prob}
+        if rest:
+            out[vid] = rest
+    return out
 
-    v1 treats the fast-path probability (1 - p_miss)^N as weather. With
-    digests piggybacked on gossip, the proposer can *measure* readiness:
-    each gossip tick, every missing transaction independently arrives with
-    probability fill_prob, validators' piggybacked digests update, and the
-    proposer counts how many digests match the proposal exactly. It
-    proposes when matches >= 2N/3 + quorum_margin (an honest-sufficient
-    condition), or at max_ticks.
 
-    Sensing rides on gossip traffic that flows anyway, so the accounting
-    adds no messages for observation; the payoff is measured by comparing
-    fast-path engagement with and without sensing at identical fill
-    dynamics. Returns the ticks waited and the consensus result.
+def readiness_sense(validators: list, block: Block, initial_obs: dict,
+                    fill_prob: float = 0.5, max_ticks: int = 8,
+                    f: int = SAFETY_F, rng=None) -> dict:
+    """Propose when the gossiped sketches say the fast path will fire.
+
+    Each tick every validator gossips the sketch of its view of the
+    candidate block to the proposer (DIGEST_WIRE bytes each, charged). The
+    proposer counts sketches exactly equal to D(B) and proposes once that
+    count reaches the fast quorum, or at max_ticks. Byzantine validators
+    can report D(B) without holding it, which only makes the proposer
+    propose early: a latency cost, never a safety one. Compare against
+    fixed_delay_propose at the same mean delay, not against delay zero.
     """
+    import bft
+    rng = rng or np.random.default_rng(0)
     n = len(validators)
-    n_req = int(math.ceil(n * 2 / 3)) + quorum_margin
+    f = bft.max_faults(n) if f is None else f
+    need = bft.fast_quorum(n, f)
+    salt = dpmh.round_salt(block.height, block.prev_hash)
+    ref = dpmh.digest(block.tx_data_strings, salt)
     obs = {vid: set(m) for vid, m in initial_obs.items()}
-    honest_ids = [v.id for v in validators if not v.is_byzantine]
-
-    ticks = 0
-    while ticks < max_ticks:
-        matches = sum(1 for vid in honest_ids if not obs.get(vid))
-        if matches >= n_req:
+    ticks, gossip_bytes = 0, 0
+    while True:
+        gossip_bytes += n * DIGEST_WIRE
+        matches = sum(1 for v in validators
+                      if dpmh.dist2(v.get_vector(block, obs.get(v.id)), ref) == 0)
+        if matches >= need or ticks >= max_ticks:
             break
+        obs = _gossip_tick(obs, fill_prob, rng)
         ticks += 1
-        for vid in list(obs.keys()):
-            remaining = {i for i in obs[vid]
-                         if np.random.random() >= fill_prob}
-            if remaining:
-                obs[vid] = remaining
-            else:
-                del obs[vid]
+    result = vector_consensus(validators, block, None, obs, f=f)
+    result.update(sense_ticks=ticks, sensed_matches=matches,
+                  sensing_bytes=gossip_bytes)
+    return result
 
-    result = vector_consensus(validators, block, threshold, obs)
-    result["sense_ticks"] = ticks
-    result["sensed_matches"] = sum(1 for vid in honest_ids
-                                   if not obs.get(vid))
+
+def fixed_delay_propose(validators: list, block: Block, initial_obs: dict,
+                        delay: int, fill_prob: float = 0.5, f: int = SAFETY_F,
+                        rng=None) -> dict:
+    """Baseline: wait a fixed number of gossip ticks, then propose."""
+    rng = rng or np.random.default_rng(0)
+    obs = {vid: set(m) for vid, m in initial_obs.items()}
+    for _ in range(delay):
+        obs = _gossip_tick(obs, fill_prob, rng)
+    result = vector_consensus(validators, block, None, obs, f=f)
+    result["sense_ticks"] = delay
     return result
 
 
@@ -1113,28 +995,31 @@ def split_bimodal(digests: dict) -> Tuple[list, list]:
     return camp_a, camp_b
 
 
-def heal_partition(set_a: set, set_b: set, height: int = 0) -> dict:
+def heal_partition(set_a: set, set_b: set, salt=0, session: int = 0) -> dict:
     """Reconcile two camps after a partition.
 
-    The camp centroids are exact by linearity, so the inter-camp
-    divergence d_hat = ||mu_a - mu_b||^2 / n is measurable before any
-    reconciliation traffic flows; one estimate-then-decode exchange
-    between camp representatives then recovers exactly the divergent
-    transactions and the union is pushed. Cost scales with the true
-    divergence, not with state size. Hash-based protocols observe only
-    quorum failure here.
+    Camp centroids are exact by linearity, so the inter-camp divergence
+    d_hat = ||mu_a - mu_b||^2 / n is visible to anyone holding the camps'
+    sketches before reconciliation starts. One estimate-then-decode
+    exchange between camp representatives recovers the divergent
+    transactions: A learns B's extras (fetched by short id, counted in
+    rec["bytes"]) and pushes its own extras to B (push_bytes). With an
+    adversary who knows the salt, d_hat can be deflated (dpmh.
+    adversarial_balance); the IBLT then doubles, costing rounds, not
+    correctness.
     """
-    d_a = dpmh.digest(sorted(set_a), height)
-    d_b = dpmh.digest(sorted(set_b), height)
+    d_a = dpmh.digest(sorted(set_a), salt)
+    d_b = dpmh.digest(sorted(set_b), salt)
     d_hat = dpmh.est_symdiff(d_a, d_b)
-    rec = reconcile.reconcile(set_a, set_b, d_hint=max(1.0, d_hat))
+    rec = reconcile.reconcile(set_a, set_b, d_hint=max(1.0, d_hat),
+                              session=session)
     union = set(set_a) | set(set_b)
-    healed = set(set_a) | rec["only_b"]
     return {
         "d_hat": d_hat,
         "true_d": rec["true_d"],
-        "recovered_union": healed == union and rec["ok"],
+        "recovered_union": rec["ok"] and (set(set_a) | rec["only_b"]) == union
+                           and (set(set_b) | rec["only_a"]) == union,
         "bytes": rec["bytes"],
         "rounds": rec["rounds"],
-        "push_bytes": (len(rec["only_a"]) + len(rec["only_b"])) * 200,
+        "push_bytes": len(rec["only_a"]) * reconcile.ITEM_BYTES,
     }

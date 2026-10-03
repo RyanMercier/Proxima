@@ -18,7 +18,7 @@ from flask import Flask, request, jsonify
 from blockchain import (
     Blockchain, Validator, BLSKeyPair, Block, Transaction, CoinbaseTx,
     make_validators, make_partial_obs, calibrate_threshold,
-    vector_consensus, tree_consensus, block_reward,
+    vector_consensus, tree_consensus, block_reward, BYZANTINE_STRATEGIES,
 )
 
 # ---------------------------------------------------------------------------
@@ -45,54 +45,27 @@ def print_block_result(block: Block, result: dict, chain):
     n_user_txs = sum(1 for tx in block.transactions if isinstance(tx, Transaction))
     header = f"{C.BOLD}{C.CYAN}[BLOCK #{block.height}]{C.RESET} Proposed by {block.proposer_name} ({n_user_txs} txs + coinbase)"
     pf(f"\n{header}")
-
-    cluster_size = result["cluster_size"]
-    n_total = cluster_size + len(result["excluded"])
+    status = (f"{C.GREEN}FINALIZED{C.RESET}" if result["finalized"]
+              else f"{C.RED}FAILED{C.RESET}")
+    path = (f"{C.GREEN}FAST PATH (1 round, {result['n_fast']} sigs){C.RESET}"
+            if result["fast_path"] else f"slow path ({result['rounds']} rounds)")
 
     if result.get("tree_mode"):
-        # Tree consensus output
-        nl = result["n_levels"]
-        br = result["branching"]
-        pf(f"  Tree: {nl} levels, branching={br}")
-        stats = result.get("level_stats", [])
-        if stats:
-            s0 = stats[0]
-            pf(f"  Level 0: {s0['groups']} leaves, "
-               f"{s0['excluded']} excluded, {s0['passed']} passed filter")
-        for s in stats[1:]:
-            pf(f"  Level {s['level']}: {s['groups']} nodes, "
-               f"{s.get('msgs_this_level', 0)} summaries (76 bytes each)")
-        status = f"{C.GREEN}FINALIZED{C.RESET}" if result["finalized"] else f"{C.RED}FAILED{C.RESET}"
-        pf(f"  Phase 2: {result['n_commits']} BLS commits, agg sig 96 bytes | {status}")
-        pf(f"  {result['msgs']:,} msgs | {result['msg_bytes'] / 1024:.1f} KB | {result['total_time']:.3f}s")
-
-    elif result["fast_path"]:
-        variance = result["cluster_variance"]
-        path = f"{C.GREEN}FAST PATH{C.RESET}"
-        pf(f"  Phase 1: {cluster_size}/{n_total} vectors | variance={variance:.4f} | {path}")
-        pf(f"  {C.GREEN}Finalized in 1 round{C.RESET} | {result['msgs']} msgs | {result['msg_bytes'] / 1024:.1f} KB")
-
-    else:
-        variance = result["cluster_variance"]
-        pf(f"  Phase 1: {cluster_size}/{n_total} vectors | variance={variance:.4f}")
-
-        excluded = result.get("excluded", [])
-        if excluded:
-            exc_parts = []
-            for name, is_byz, strategy, dist in excluded:
-                if is_byz:
-                    exc_parts.append(f"{C.RED}{name}(d={dist:.1f}, {strategy}){C.RESET}")
-                else:
-                    exc_parts.append(f"{C.YELLOW}{name}(d={dist:.1f}){C.RESET}")
-            pf(f"  Excluded: {', '.join(exc_parts)}")
-
-        if result["sync_pushed"] > 0:
-            for vname, n_miss in result["sync_details"]:
-                pf(f"  {C.DIM}Pushed {n_miss} tx to {vname} (bloom diff){C.RESET}")
-
-        status = f"{C.GREEN}FINALIZED{C.RESET}" if result["finalized"] else f"{C.RED}FAILED{C.RESET}"
-        pf(f"  Phase 2: {result['n_commits']} BLS commits | agg sig 96 bytes | {status}")
-        pf(f"  {result['msgs']} msgs | {result['msg_bytes'] / 1024:.1f} KB | {result['total_time']:.3f}s")
+        pf(f"  Tree: {result['n_levels']} levels, branching={result['branching']}, "
+           f"{result['fallback_leaves']} Byzantine leaf leaders bypassed")
+    flagged = result.get("excluded", [])
+    if flagged:
+        parts = []
+        for name, is_byz, strategy, dist in flagged:
+            colour = C.RED if is_byz else C.YELLOW
+            tag = f", {strategy}" if is_byz else ""
+            parts.append(f"{colour}{name}(d={dist:.1f}{tag}){C.RESET}")
+        pf(f"  Sketch flags (observability only): {', '.join(parts)}")
+    for vname, n_miss in result.get("sync_details", []):
+        pf(f"  {C.DIM}{vname} fetched {n_miss} tx by id{C.RESET}")
+    pf(f"  {path} | {result['n_commits']} valid signatures | {status}")
+    pf(f"  {result['msgs']:,} msgs | {result['msg_bytes'] / 1024:.1f} KB | "
+       f"leader in {result['leader_in_bytes'] / 1024:.1f} KB")
 
     # Balance updates for named accounts
     balances = []
@@ -314,8 +287,7 @@ def main():
     parser.add_argument("--honest", type=int, default=4, help="Number of honest validators")
     parser.add_argument("--byzantine", type=int, default=1, help="Number of Byzantine validators")
     parser.add_argument("--byzantine-strategy", default="drop_half",
-                        choices=["drop_half", "random_vector", "replace_one_tx",
-                                 "mimic_honest", "coalition"])
+                        choices=BYZANTINE_STRATEGIES)
     parser.add_argument("--interval", type=float, default=5.0,
                         help="Seconds between mining attempts")
     parser.add_argument("--miss-prob", type=float, default=0.37,

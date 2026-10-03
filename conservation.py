@@ -1,328 +1,335 @@
 """
-conservation.py -- Cross-shard conservation for Proxima v2.
+conservation.py -- Cross-shard conservation (double-entry bookkeeping with
+homomorphic digests).
 
-Double-entry bookkeeping in vector space (docs/v2_formal_foundations.md,
-Section 8). Every cross-shard transaction t from shard i to shard j
-contributes +v(t) (ledger domain) to i's outbound corridor accumulator
-O[i][j] when the debit applies and +v(t) to j's inbound accumulator
-I[i][j] when the credit applies. The system invariant is
+Every cross-shard transaction t from shard i to shard j, debited at block
+h, contributes the ledger digest of the corridor-keyed item "i>j|t" to
+i's outbound accumulator O[i,j][h] and, when the destination applies the
+credit (whose message carries h), to j's inbound accumulator I[i,j][h].
+Digests are dpmh.LedgerDigest: LtHash for binding plus a sketch for size
+estimates.
 
-    sum_i O_i  ==  sum_j I_j   (mod q, over a settlement window)
+Invariant, checked only over SETTLED cohorts (debit height <= now - W):
 
-so any minted, lost, or replayed cross-shard effect breaks a signed,
-collision-binding equality. Checking is O(S) kilobyte-scale objects per
-block instead of O(S^2) pair relations or O(volume) receipts.
+    sum_i O_i[<= now-W]  ==  sum_j I_j[<= now-W]
 
-Refinements implemented here (Sections 8 and 14 of the foundations doc):
+Indexing by debit height means honest settlement lag never alarms: a
+cohort is examined only after its window has passed, whatever the traffic.
 
-- Pending-set digests: P_ij = O_ij - I_ij is itself the ledger digest of
-  the in-flight transactions on corridor (i, j); its norm meters in-flight
-  volume continuously, and the invariant is enforced as "P_ij decays to
-  zero within W blocks" (credits necessarily lag debits), with per-corridor
-  aging alarms rather than per-block equality.
-- Group-testing localization: on alarm, the beacon bisects the corridor
-  set with aggregated digests, localizing f faulty corridors in
-  O(f log C) probes; bisection over a linear measurement is exact.
-- Corridor syndromes: each corridor also carries an IBLT of its in-flight
-  set (both objects are linear), so an alarmed corridor decodes exactly
-  the dangling transactions without a further exchange.
-- Global ledger digest G and verifiable prune accounting come from
-  dpmh.Accumulator / dpmh.prove_prune.
+Threat model. Each shard's quorum attests honestly to what that shard
+applied (shard-internal execution is secured by its own BFT). Faults
+caught here are in the cross-shard path: dropped, misrouted, replayed, or
+minted credits (relayer bugs, Byzantine relayers, bridge faults). A
+Byzantine shard quorum could sign accumulators that misreport what it
+applied; that requires state-validity or fraud proofs and is out of scope.
 
-Semantics: this is detection and settlement verification, not locking.
-Pair with optimistic execution + revert window, or credit-on-match.
+What the corridor keying buys. Without it a credit applied on the wrong
+corridor (debit on i->j, credit on k->l) cancels globally and evades both
+the invariant and bisection. With it, the misroute appears as a fault on
+both corridors, and any cancellation inside a bisection group requires an
+LtHash collision, so group tests are exact.
+
+Cost. Each shard publishes two signed ledger digests per block: O(S)
+objects, independent of transaction volume and of the corridor count C.
+A per-corridor batch root is cheaper per object (32 B) but costs O(C),
+which is O(S^2) on a dense corridor graph; the crossover is computed
+below rather than asserted.
 """
 
 import math
-from collections import defaultdict
-
-import numpy as np
+from collections import Counter, defaultdict
 
 import dpmh
 import reconcile
 
-SIG_BYTES = 96          # BLS aggregate per shard attestation
-LEDGER_WIRE = dpmh.wire_bytes("ledger")   # 2048 B per accumulator
-RECEIPT_BYTES = 32      # per-tx receipt hash in the batched-receipt baseline
-ROOT_BYTES = 32         # per-corridor batch commitment in baselines
+SIG_BYTES = 96
+LEDGER_WIRE = dpmh.ledger_wire_bytes()    # 2048 B LtHash + 2048 B sketch
+RECEIPT_BYTES = 32
+ROOT_BYTES = 32
+
+
+def corridor_item(i: int, j: int, tx: str) -> str:
+    return f"{i}>{j}|{tx}"
 
 
 class ShardSystem:
-    """S shards, corridor accumulators, beacon-side conservation checks."""
-
-    def __init__(self, n_shards: int, window: int = 2, n: int = dpmh.N_LEDGER):
+    def __init__(self, n_shards: int, window: int = 2):
         self.S = n_shards
         self.W = window
-        self.n = n
-        z = lambda: np.zeros(n, dtype=np.int64)
-        self.O = defaultdict(z)     # (i, j) -> outbound accumulator
-        self.I = defaultdict(z)     # (i, j) -> inbound accumulator
-        self.debited = defaultdict(set)     # (i, j) -> txs the source applied
-        self.credited = defaultdict(set)    # (i, j) -> txs the dest applied
-        self.pending_since = {}     # (i, j) -> block when pending went nonzero
-        self.block = 0
+        self.now = 0
+        self.O = defaultdict(lambda: defaultdict(dpmh.LedgerDigest))
+        self.I = defaultdict(lambda: defaultdict(dpmh.LedgerDigest))
+        self.debited = defaultdict(Counter)    # (i, j) -> multiset of (tx, h)
+        self.credited = defaultdict(Counter)
 
     # -- shard-side operations ------------------------------------------
 
-    def debit(self, i: int, j: int, tx: str) -> None:
-        self.O[(i, j)] += dpmh.tx_vector(tx, 0, dpmh.LEDGER_DOMAIN, self.n)
-        self.debited[(i, j)].add(tx)
+    def debit(self, i: int, j: int, tx: str) -> int:
+        """Source applies the debit at the current block; returns h."""
+        h = self.now
+        self.O[(i, j)][h] = self.O[(i, j)][h] + dpmh.LedgerDigest.item(
+            corridor_item(i, j, tx))
+        self.debited[(i, j)][(tx, h)] += 1
+        return h
 
-    def credit(self, i: int, j: int, tx: str) -> None:
-        self.I[(i, j)] += dpmh.tx_vector(tx, 0, dpmh.LEDGER_DOMAIN, self.n)
-        self.credited[(i, j)].add(tx)
+    def credit(self, i: int, j: int, tx: str, h: int) -> None:
+        """Destination applies a credit claiming corridor (i, j), height h."""
+        self.I[(i, j)][h] = self.I[(i, j)][h] + dpmh.LedgerDigest.item(
+            corridor_item(i, j, tx))
+        self.credited[(i, j)][(tx, h)] += 1
 
-    def pending(self, i: int, j: int) -> np.ndarray:
-        """P_ij = O_ij - I_ij: the ledger digest of the in-flight set."""
-        return self.O[(i, j)] - self.I[(i, j)]
+    def advance_block(self) -> None:
+        self.now += 1
 
-    def corridor_syndrome(self, i: int, j: int, d_hint: float) -> reconcile.IBLT:
-        """IBLT of the applied-debit view, sized by the pending norm."""
-        m = reconcile.size_for(d_hint)
-        return reconcile.IBLT.of(self.debited[(i, j)], m)
+    # -- digests ----------------------------------------------------------
+
+    def _settled(self, acc: dict) -> dpmh.LedgerDigest:
+        out = dpmh.LedgerDigest()
+        for h, d in acc.items():
+            if h <= self.now - self.W:
+                out = out + d
+        return out
+
+    def pending(self, key) -> dpmh.LedgerDigest:
+        """Settled O - I on a corridor: the digest of its dangling items."""
+        return self._settled(self.O[key]) - self._settled(self.I[key])
+
+    def corridors(self) -> list:
+        return sorted(set(self.O) | set(self.I))
 
     # -- beacon-side checks ----------------------------------------------
 
-    def advance_block(self) -> None:
-        """End-of-block bookkeeping: age nonzero pending corridors."""
-        self.block += 1
-        for key in set(list(self.O.keys()) + list(self.I.keys())):
-            p = self.O[key] - self.I[key]
-            if np.any(p != 0):
-                self.pending_since.setdefault(key, self.block)
-            else:
-                self.pending_since.pop(key, None)
-
     def global_invariant(self) -> dict:
-        """Check sum_i O_i == sum_j I_j; violation norm estimates danglers.
+        """Compare the sum of all settled outbound vs inbound digests.
 
-        Verification cost per block: each shard publishes its aggregated
-        outbound and inbound accumulators, quorum-signed.
+        The beacon receives per-shard aggregates (2 signed objects per
+        shard); summing per corridor here is the same arithmetic.
         """
-        total_o = np.zeros(self.n, dtype=np.int64)
-        total_i = np.zeros(self.n, dtype=np.int64)
-        for key, acc in self.O.items():
-            total_o += acc
-        for key, acc in self.I.items():
-            total_i += acc
-        delta = total_o - total_i
-        holds = bool(np.all(delta == 0))
-        bytes_per_block = self.S * 2 * (LEDGER_WIRE + SIG_BYTES)
-        return {
-            "holds": holds,
-            "dangling_estimate": dpmh.est_symdiff(total_o, total_i),
-            "verification_bytes": bytes_per_block,
-        }
+        total = dpmh.LedgerDigest()
+        for key in self.corridors():
+            total = total + self.pending(key)
+        return {"holds": total.is_zero(),
+                "dangling_estimate": total.est(),
+                "verification_bytes": conservation_verification_bytes(self.S)}
 
     def aged_alarms(self) -> list:
-        """Corridors whose pending digest has persisted beyond the window.
+        """Corridors with a nonzero settled pending digest."""
+        return [k for k in self.corridors() if not self.pending(k).is_zero()]
 
-        Ordinary settlement lag (credit lands within W blocks of the debit)
-        never alarms; only stuck or faulty corridors do.
+    def localize(self) -> dict:
+        """Adaptive group testing over corridors (bisection).
+
+        Each probe asks the involved shards for one aggregated settled
+        pending digest over a group of corridors. With corridor-keyed
+        items, a group sums to zero iff every corridor in it is clean
+        (else an LtHash collision was found), so recursion is exact. Cost
+        is at most 2 f ceil(log2(C / f)) + 1 probes for f faulty corridors.
+        When f is a large fraction of C, testing each corridor directly
+        (C probes) is cheaper; the beacon cannot know f in advance, so both
+        counts are reported rather than picking the winner in hindsight.
         """
-        return [key for key, since in self.pending_since.items()
-                if self.block - since >= self.W]
-
-    def localize(self, expected_inflight: dict = None) -> dict:
-        """Group-testing localization of faulty corridors.
-
-        The beacon holds only per-shard aggregates; on a global-invariant
-        failure it requests digests aggregated over halves of the corridor
-        list, recursing into imbalanced halves. Bisection over a linear
-        measurement is exact. Each probe costs one signed accumulator.
-
-        expected_inflight: corridor -> set of txs legitimately in flight
-        (from the current window); a corridor is faulty if its pending
-        digest differs from the digest of its legitimate in-flight set.
-        """
-        expected_inflight = expected_inflight or {}
-        corridors = sorted(set(list(self.O.keys()) + list(self.I.keys())))
-
-        def corridor_fault(key) -> bool:
-            expect = dpmh.ledger_digest(
-                sorted(expected_inflight.get(key, set())), self.n)
-            return not dpmh.wire_equal(self.pending(*key), expect, "ledger")
-
-        def agg_fault(keys) -> bool:
-            actual = np.zeros(self.n, dtype=np.int64)
-            expect = np.zeros(self.n, dtype=np.int64)
-            for key in keys:
-                actual += self.pending(*key)
-                expect += dpmh.ledger_digest(
-                    sorted(expected_inflight.get(key, set())), self.n)
-            return not dpmh.wire_equal(actual, expect, "ledger")
-
+        keys = self.corridors()
         probes = 0
         faulty = []
 
-        def bisect(keys):
+        def zero(group):
             nonlocal probes
             probes += 1
-            if not agg_fault(keys):
+            tot = dpmh.LedgerDigest()
+            for k in group:
+                tot = tot + self.pending(k)
+            return tot.is_zero()
+
+        def bisect(group):
+            if zero(group):
                 return
-            if len(keys) == 1:
-                faulty.append(keys[0])
+            if len(group) == 1:
+                faulty.append(group[0])
                 return
-            mid = len(keys) // 2
-            bisect(keys[:mid])
-            bisect(keys[mid:])
+            mid = len(group) // 2
+            bisect(group[:mid])
+            bisect(group[mid:])
 
-        if corridors:
-            bisect(corridors)
-        return {
-            "faulty": faulty,
-            "probes": probes,
-            "probe_bytes": probes * (LEDGER_WIRE + SIG_BYTES),
-            "bound": (len(faulty) or 1) * max(
-                1, math.ceil(math.log2(max(len(corridors), 2)))) * 2,
-        }
+        if keys:
+            bisect(keys)
+        return {"faulty": faulty, "probes": probes,
+                "individual_probes": len(keys),
+                "probe_bytes": probes * (LEDGER_WIRE + SIG_BYTES)}
 
-    def decode_corridor(self, key, expected_inflight: set = None) -> dict:
-        """Identify the exact dangling txs on an alarmed corridor.
+    def decode_corridor(self, key, session: int = 0) -> dict:
+        """Exact dangling items on a corridor, multiset-aware.
 
-        Two-syndrome step: the pending digest norm sizes an IBLT exchange
-        between the source's applied-debit set and the destination's
-        applied-credit set. Their symmetric difference is exactly the
-        dropped credits (debited, never credited) plus the minted credits
-        (credited, never debited); peeling recovers both.
+        IBLT over (tx, h) short ids of settled debits vs settled credits,
+        with multiplicities: a replayed credit (multiplicity 2) leaves a
+        count of -1 and decodes as a minted extra. Sized by the sketch
+        estimate of the pending digest.
         """
-        d_hat = max(1.0, dpmh.est_symdiff(self.O[key], self.I[key]))
-        res = reconcile.reconcile(self.debited[key], self.credited[key],
-                                  d_hint=d_hat)
-        return {"dangling": res["only_a"] | res["only_b"],
-                "dropped": res["only_a"], "minted": res["only_b"],
-                "ok": res["ok"], "bytes": res["bytes"], "d_hat": d_hat}
+        settled = lambda c: Counter({x: n for x, n in c.items()
+                                     if x[1] <= self.now - self.W})
+        deb, cred = settled(self.debited[key]), settled(self.credited[key])
+        d_hat = max(1.0, self.pending(key).est())
+        m = reconcile.size_for(d_hat)
+        for attempt in range(8):
+            sess = session * 1009 + attempt
+            sid = lambda x: reconcile._key64(f"{x[0]}@{x[1]}", sess)
+            t_d, t_c = reconcile.IBLT(m, attempt), reconcile.IBLT(m, attempt)
+            for x, mult in deb.items():
+                for _ in range(mult):
+                    t_d.insert_key(sid(x))
+            for x, mult in cred.items():
+                for _ in range(mult):
+                    t_c.insert_key(sid(x))
+            a, b, ok = t_d.subtract(t_c).peel()
+            if ok:
+                ids = {sid(x): x for x in set(deb) | set(cred)}
+                return {"dropped": {ids[k] for k in a},
+                        "minted": {ids[k] for k in b},
+                        "ok": True, "d_hat": d_hat,
+                        "bytes": (attempt + 1) * m * reconcile.CELL_BYTES}
+            m *= 2
+        return {"dropped": set(), "minted": set(), "ok": False,
+                "d_hat": d_hat, "bytes": 0}
 
 
 # ---------------------------------------------------------------------------
-# Baseline verification-metadata models (per block)
+# Verification-metadata models (bytes per block at the verifier)
 # ---------------------------------------------------------------------------
-
-def receipts_verification_bytes(txs_per_block: int, corridors: int) -> int:
-    """Batched receipts: per-corridor batch root + per-tx receipt data."""
-    return corridors * (ROOT_BYTES + SIG_BYTES) + txs_per_block * RECEIPT_BYTES
-
-
-def two_pc_verification_bytes(txs_per_block: int, corridors: int) -> int:
-    """Batched 2PC: prepare/commit batch certificates + per-tx votes."""
-    return corridors * 2 * (ROOT_BYTES + SIG_BYTES) + txs_per_block * 2 * RECEIPT_BYTES
-
 
 def conservation_verification_bytes(n_shards: int) -> int:
-    """Conservation: 2 signed accumulators per shard, volume-independent."""
+    """2 signed ledger digests per shard; independent of volume and C."""
     return n_shards * 2 * (LEDGER_WIRE + SIG_BYTES)
+
+
+def corridor_root_verification_bytes(n_corridors: int) -> int:
+    """Each corridor's source and destination publish a signed batch root;
+    the verifier compares them pairwise. Volume-independent, O(C)."""
+    return n_corridors * 2 * (ROOT_BYTES + SIG_BYTES)
+
+
+def receipts_verification_bytes(txs_per_block: int, n_corridors: int) -> int:
+    """Batched receipts: per-corridor signed root plus a 32 B receipt per
+    transaction checked at the destination."""
+    return n_corridors * (ROOT_BYTES + SIG_BYTES) + txs_per_block * RECEIPT_BYTES
+
+
+def crossover_shards_full_mesh() -> int:
+    """Smallest S where conservation beats per-corridor roots on a full
+    mesh (C = S(S-1))."""
+    s = 2
+    while conservation_verification_bytes(s) >= corridor_root_verification_bytes(
+            s * (s - 1)):
+        s += 1
+    return s
 
 
 # ---------------------------------------------------------------------------
 # Simulation
 # ---------------------------------------------------------------------------
 
-def simulate(n_shards: int = 16, blocks: int = 6, txs_per_corridor: int = 150,
-             n_faulty_corridors: int = 2, faults_per_corridor: int = 4,
-             seed: int = 42, window: int = 2) -> dict:
-    """Ring-of-shards run with faults injected into a few chosen corridors.
+def simulate(n_shards: int = 16, blocks: int = 8, txs_per_corridor: int = 40,
+             topology: str = "ring", lag: int = 1, window: int = 2,
+             faults: dict = None, seed: int = 42) -> dict:
+    """Run S shards with credits landing `lag` blocks after debits.
 
-    Faults: dropped credits (destination never applies) and minted credits
-    (destination applies a tx no source debited). The run extends past the
-    settlement window, so at check time every legitimate transaction has
-    settled and the expected in-flight set is empty: any nonzero pending
-    corridor is faulty. Measures detection, O(f log C) localization,
-    exact decode of the dangling transactions, and verification bytes per
-    block against the batched baselines.
+    faults: corridor -> list of (kind, k) with kind in
+      "drop"     credit for the k-th tx of block 1 never lands
+      "replay"   credit for the k-th tx of block 1 lands twice
+      "mint"     a credit with no debit lands (claims height 1)
+      "misroute" the k-th tx of block 1 is credited on another corridor
+    Faults are injected in block 1, so they are settled by the end of the
+    run while the last `lag` blocks remain legitimately in flight.
     """
-    rng = np.random.default_rng(seed)
-    sys = ShardSystem(n_shards, window=window)
-    faulty_set = set()
-    while len(faulty_set) < n_faulty_corridors:
-        i = int(rng.integers(0, n_shards))
-        faulty_set.add((i, (i + 1) % n_shards))
-    injected = defaultdict(set)     # corridor -> dangling txs
-
-    total_txs = 0
+    import random
+    rnd = random.Random(seed)
+    faults = faults or {}
+    sysm = ShardSystem(n_shards, window=window)
+    if topology == "ring":
+        corr = [(i, (i + 1) % n_shards) for i in range(n_shards)]
+    else:
+        corr = [(i, j) for i in range(n_shards) for j in range(n_shards) if i != j]
+    other = {c: corr[(corr.index(c) + 1) % len(corr)] for c in corr}
+    inflight = []                       # (land_at, i, j, tx, h, times)
+    truth = defaultdict(lambda: {"dropped": set(), "minted": set()})
+    total = 0
     for b in range(blocks):
-        for i in range(n_shards):
-            j = (i + 1) % n_shards
+        for (i, j) in corr:
+            kinds = dict((k, kind) for kind, k in faults.get((i, j), []))
             for k in range(txs_per_corridor):
-                tx = f"blk{b}-c{i}-{k}"
-                total_txs += 1
-                sys.debit(i, j, tx)
-                drop = ((i, j) in faulty_set and b == 1
-                        and k < faults_per_corridor)
-                if drop:
-                    injected[(i, j)].add(tx)   # credit never lands
-                else:
-                    sys.credit(i, j, tx)
-        # a minted credit on one faulty corridor (no matching debit)
-        if b == 2 and faulty_set:
-            i, j = sorted(faulty_set)[0]
-            tx = f"MINT-{b}-{i}"
-            sys.credit(i, j, tx)
-            injected[(i, j)].add(tx)
-        sys.advance_block()
+                tx = f"b{b}-{i}>{j}-{k}"
+                total += 1
+                h = sysm.debit(i, j, tx)
+                kind = kinds.get(k) if b == 1 else None
+                if kind == "drop":
+                    truth[(i, j)]["dropped"].add((tx, h))
+                    continue
+                if kind == "misroute":
+                    oi, oj = other[(i, j)]
+                    inflight.append((b + lag, oi, oj, tx, h, 1))
+                    truth[(i, j)]["dropped"].add((tx, h))
+                    truth[(oi, oj)]["minted"].add((tx, h))
+                    continue
+                times = 2 if kind == "replay" else 1
+                if kind == "replay":
+                    truth[(i, j)]["minted"].add((tx, h))
+                inflight.append((b + lag, i, j, tx, h, times))
+            if b == 1:
+                for kind, k in faults.get((i, j), []):
+                    if kind == "mint":
+                        tx = f"MINT-{i}>{j}-{k}"
+                        inflight.append((b + lag, i, j, tx, 1, 1))
+                        truth[(i, j)]["minted"].add((tx, 1))
+        rnd.shuffle(inflight)
+        still = []
+        for item in inflight:
+            land, i, j, tx, h, times = item
+            if land <= b:
+                for _ in range(times):
+                    sysm.credit(i, j, tx, h)
+            else:
+                still.append(item)
+        inflight = still
+        sysm.advance_block()
 
-    check = sys.global_invariant()
-    faults_injected = sum(len(s) for s in injected.values())
-    alarms = sys.aged_alarms()
-
-    # Post-window: nothing should still be in flight.
-    expected_empty = {}
-    loc = sys.localize(expected_empty) if not check["holds"] else {
-        "faulty": [], "probes": 0, "probe_bytes": 0, "bound": 0}
-
-    decode_ok = True
-    decoded_danglers = set()
-    for key in loc["faulty"]:
-        d = sys.decode_corridor(key, set())
-        decode_ok = decode_ok and d["ok"]
-        decoded_danglers |= d["dangling"]
-
-    truly_dangling = set()
-    for s in injected.values():
-        truly_dangling |= s
-
-    corridors = n_shards  # ring
-    txs_per_block = total_txs // blocks
+    check = sysm.global_invariant()
+    alarms = sysm.aged_alarms()
+    loc = sysm.localize()
+    decoded = {k: sysm.decode_corridor(k) for k in loc["faulty"]}
+    truly_faulty = sorted(k for k, t in truth.items() if t["dropped"] or t["minted"])
+    decode_exact = all(decoded[k]["ok"]
+                       and decoded[k]["dropped"] == truth[k]["dropped"]
+                       and decoded[k]["minted"] == truth[k]["minted"]
+                       for k in truly_faulty if k in decoded)
+    n_faults = sum(len(t["dropped"]) + len(t["minted"]) for t in truth.values())
     return {
-        "shards": n_shards,
-        "blocks": blocks,
-        "total_txs": total_txs,
-        "faults_injected": faults_injected,
+        "shards": n_shards, "corridors": len(corr), "blocks": blocks,
+        "total_txs": total, "in_flight_at_check": len(inflight),
+        "faults_injected": n_faults,
         "invariant_violated": not check["holds"],
-        "detected": (not check["holds"]) == (faults_injected > 0),
         "dangling_estimate": check["dangling_estimate"],
         "aged_alarms": sorted(alarms),
+        "truly_faulty": truly_faulty,
+        "alarms_exact": sorted(alarms) == truly_faulty,
         "localized": sorted(loc["faulty"]),
-        "truly_faulty": sorted(injected.keys()),
-        "localization_exact": set(loc["faulty"]) == set(injected.keys()),
+        "localization_exact": sorted(loc["faulty"]) == truly_faulty,
         "probes": loc["probes"],
-        "probe_bound": loc["bound"],
-        "decode_ok": decode_ok,
-        "decode_exact": decoded_danglers == truly_dangling,
+        "decode_exact": decode_exact and set(decoded) == set(truly_faulty),
         "verify_bytes": {
             "conservation": conservation_verification_bytes(n_shards),
-            "receipts": receipts_verification_bytes(txs_per_block, corridors),
-            "2pc": two_pc_verification_bytes(txs_per_block, corridors),
+            "corridor_roots": corridor_root_verification_bytes(len(corr)),
+            "receipts": receipts_verification_bytes(
+                total // blocks, len(corr)),
         },
-        "receipts_crossover_txs": (
-            conservation_verification_bytes(n_shards)
-            - corridors * (ROOT_BYTES + SIG_BYTES)) // RECEIPT_BYTES,
     }
 
 
 if __name__ == "__main__":
-    r = simulate()
-    print(f"shards={r['shards']} blocks={r['blocks']} txs={r['total_txs']} "
-          f"faults={r['faults_injected']} on corridors {r['truly_faulty']}")
-    print(f"invariant violated: {r['invariant_violated']} "
-          f"(dangling estimate {r['dangling_estimate']:.1f}, "
-          f"true {r['faults_injected']})")
-    print(f"aged alarms: {r['aged_alarms']}")
-    print(f"localized {r['localized']} in {r['probes']} probes "
-          f"(bound ~{r['probe_bound']}); exact={r['localization_exact']}")
-    print(f"decode ok={r['decode_ok']} exact={r['decode_exact']}")
-    vb = r["verify_bytes"]
-    print(f"verification bytes/block: conservation={vb['conservation']:,} "
-          f"(volume-independent), receipts={vb['receipts']:,}, "
-          f"2pc={vb['2pc']:,}")
-    print(f"receipts overtake conservation above "
-          f"~{r['receipts_crossover_txs']:,} cross-shard txs/block")
+    f = {(0, 1): [("drop", 0), ("drop", 1)], (3, 4): [("replay", 2)],
+         (7, 8): [("mint", 0)], (10, 11): [("misroute", 5)]}
+    r = simulate(faults=f)
+    for k in ("total_txs", "in_flight_at_check", "faults_injected",
+              "invariant_violated", "dangling_estimate", "truly_faulty",
+              "alarms_exact", "localization_exact", "probes", "decode_exact",
+              "verify_bytes"):
+        print(f"{k}: {r[k]}")
+    print("full-mesh crossover vs per-corridor roots: S >=",
+          crossover_shards_full_mesh())

@@ -23,7 +23,7 @@ from blockchain import (
     Blockchain, make_validators, make_partial_obs, calibrate_threshold,
     vector_consensus, tree_consensus, BLSKeyPair,
 )
-from hotstuff import hotstuff_consensus, pbft_consensus
+from hotstuff import hotstuff_consensus, hotstuff2_consensus, pbft_consensus
 
 
 class C:
@@ -121,7 +121,7 @@ def run_standalone_benchmark(n_txs: int, n_validators: int, n_byzantine: int,
     print(f"  Messages per block: {avg_msgs:.0f} avg")
     print(f"  Bandwidth per block: {avg_bytes / 1024:.0f} KB avg")
 
-    # Count Byzantine exclusions
+    # Count Byzantine sketches flagged (observability only)
     byz_excluded = 0
     for r in our_results:
         for name, is_byz, strat, dist in r.get("excluded", []):
@@ -129,16 +129,18 @@ def run_standalone_benchmark(n_txs: int, n_validators: int, n_byzantine: int,
                 byz_excluded += 1
     total_byz_opportunities = n_blocks * n_byzantine
     if total_byz_opportunities > 0:
-        print(f"  Byzantine excluded: {byz_excluded}/{total_byz_opportunities} "
+        print(f"  Byzantine sketches flagged: {byz_excluded}/{total_byz_opportunities} "
               f"({100 * byz_excluded / total_byz_opportunities:.0f}%)")
 
     # HotStuff comparison (same scenario)
     print(f"\n{C.BOLD}COMPARISON (same scenario):{C.RESET}")
     hs = hotstuff_consensus(n_validators, n_byzantine, txs_per_block, miss_prob)
+    hs2 = hotstuff2_consensus(n_validators, n_byzantine, txs_per_block, miss_prob)
     pbft = pbft_consensus(n_validators, n_byzantine, txs_per_block)
 
     print(f"  {C.CYAN}Ours:    {C.RESET} {avg_msgs:>6.0f} msgs/block, {avg_bytes / 1024:>6.0f} KB/block")
     print(f"  {C.YELLOW}HotStuff:{C.RESET} {hs['msgs']:>6} msgs/block, {hs['msg_bytes'] / 1024:>6.0f} KB/block")
+    print(f"  {C.YELLOW}HotStuff-2:{C.RESET} {hs2['msgs']:>4} msgs/block, {hs2['msg_bytes'] / 1024:>6.0f} KB/block")
     print(f"  {C.RED}PBFT:    {C.RESET} {pbft['msgs']:>6} msgs/block, {pbft['msg_bytes'] / 1024:>6.0f} KB/block")
 
     # Scale test
