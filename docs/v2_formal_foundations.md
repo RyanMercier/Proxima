@@ -1,5 +1,30 @@
 # Formal Foundations for Proxima v2: Distance-Preserving Multiset Hashes
 
+> **Superseded in part (October 2026 audit).** This file is kept as the
+> historical design record. Where it conflicts with `paper_v2/proxima_v2.tex`
+> and the code, the paper and code are right:
+>
+> - Section 5 (binding): the +-1 accumulator gains nothing from its modulus
+>   (sums never wrap, so mod-q collisions are integer collisions); the
+>   LtHash inheritance and the 2^512 estimate are invalid. The ledger now
+>   binds with real LtHash (uniform Z_{2^16}^1024); the sketch rides along
+>   for estimates only.
+> - Section 6 (deflation): greedy side-choosing deflates without bound at
+>   polynomial cost (`dpmh.adversarial_balance`); the "constant factors at
+>   exponential cost" bound is wrong, and height salts are predictable
+>   (now height + previous block hash). The impossibility theorem is
+>   overclaimed relative to robust property-preserving hashing.
+> - Section 3 (liveness): the Hoeffding bound ignores Byzantine abstainers.
+> - Section 10 (fast path): 2N/3 one-round finality is unsafe across view
+>   changes. The safe quorum is ceil((n+3f+1)/2) with vote histories in
+>   NEW-VIEW (`bft.py`, fuzzed).
+> - Section 7 (median reference): the aggregator still chooses which
+>   inputs count; inside consensus the reference is D(B).
+> - Section 8 (conservation): needs corridor-keyed items (misroutes cancel
+>   otherwise), debit-height cohorts (honest lag alarms otherwise), and an
+>   explicit threat model.
+> - Lemma 1 holds for sets; for multisets it estimates ||c||_2^2.
+
 > Status: design notes for the extended version / follow-on paper. None of this
 > is part of the BLOCKCHAIN'26 camera-ready, whose construction and numbers are
 > frozen to what reviewers accepted (see paper/CUTS.md and paper/BLOCKERS.md).

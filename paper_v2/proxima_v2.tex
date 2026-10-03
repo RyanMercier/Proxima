@@ -1,6 +1,6 @@
 % Proxima v2 journal manuscript. Target: IEEE Transactions on Dependable
-% and Secure Computing (IEEEtran journal mode); retargeting to another
-% IEEE venue is a one-line class-option change.
+% and Secure Computing (IEEEtran journal mode). Every number in this file
+% is produced by visualize_v2_paper.py and stored in results.json.
 \documentclass[journal]{IEEEtran}
 
 \usepackage{amsmath,amssymb}
@@ -20,68 +20,62 @@
 
 \newcommand{\dd}{\ensuremath{\Delta D}}
 \newcommand{\norm}[1]{\ensuremath{\lVert #1 \rVert}}
+\newcommand{\nf}{\ensuremath{n_{\mathrm{fast}}}}
 
 \urldef{\repourl}\url{https://github.com/RyanMercier/Proxima}
 
 \begin{document}
 
-\title{Distance-Preserving Multiset Hashes: Separating Agreement
-Estimation from Agreement Security in Byzantine Consensus}
+\title{Agreement Observability for Byzantine Consensus:\\
+Estimation Sketches, Binding Accumulators, and a Safe Fast Path}
 
 \author{Ryan~Mercier%
 \thanks{R. Mercier is with the School of Engineering, University of
 Connecticut, Storrs, CT, USA (e-mail: ryan.mercier@uconn.edu).}%
-\thanks{Code and reproduction artifacts: \repourl. An earlier version of this
-work appeared at the 8th International Congress on Blockchain and
-Applications~\cite{mercier2026proxima}; this article replaces that
-version's primitive with a zero-mean construction, adds the binding
-accumulator, the impossibility and composition theorems, robust reference
-selection, readiness sensing, exact set reconciliation, and conservation
-sharding, and evaluates against HotStuff-2 and Kauri.}}
+\thanks{Code, tests, and every number in this article: \repourl.
+An earlier version appeared at the 8th International Congress on
+Blockchain and Applications~\cite{mercier2026proxima}. Section~\ref{sec:errata}
+lists the claims of that version this article corrects, including an
+unsafe fast path.}}
 
-\markboth{Preprint}{Mercier: Distance-Preserving Multiset Hashes}
+\markboth{Preprint}{Mercier: Agreement Observability for Byzantine Consensus}
 
 \maketitle
 
 \begin{abstract}
 Byzantine fault tolerant (BFT) protocols compare validator state with
-collision-resistant hashes, and collision resistance destroys distance:
-validators that agree on 19 of 20 transactions produce unrelated hashes,
-indistinguishable from validators that share nothing. We argue that
-agreement \emph{estimation} and agreement \emph{security} are different
-jobs that deserve different objects, and we show that one linear-algebraic
-object can serve both. A distance-preserving multiset hash (DPMH) maps
-each transaction to a zero-mean vector in $\{-1,+1\}^{n}$ and digests a
-set by coordinate-wise integer summation, so that
-$\norm{\dd}^{2}/n$ is an unbiased estimator of the multiset symmetric
-difference with relative error at most $\sqrt{2/n}$, while equality of the
-mod-$q$ digest is a collision-binding property whose violation reduces to
-a short-integer-solution problem over a $\pm 1$ matrix. We prove that no
-distance-preserving hash can make \emph{proximity} authoritative, which
-forces an architecture: distance may gate scheduling, synchronization, and
-optimism, never safety; and we prove a composition theorem showing that
-any BFT protocol whose commit predicate is a quorum of signatures retains
-its safety unchanged under such an estimation layer. On this foundation we
-rebuild Proxima, a two-phase BFT protocol with a speculative fast path
-whose trigger is honest-sufficient (a quorum of signed commitments, not a
-variance statistic an adversary can perturb), a Byzantine-robust reference
-(coordinate-wise median), straggler synchronization by
-estimate-then-decode set reconciliation, $O(\log H)$ fork localization,
-partition healing at cost proportional to divergence, and a cross-shard
-\emph{conservation invariant} that verifies sharded settlement with
-volume-independent metadata and localizes faulty corridors in
-$O(f \log C)$ signed probes. Simulations confirm every closed form and
-show the protocol consequences: a single in-cluster Byzantine validator
-disables the prior fast path but not ours; a Byzantine aggregator excludes
-every honest validator under the prior reference and none under ours; and
-message complexity stays $1.5$ to $2\times$ below HotStuff-2 at
-$N \le 3000$ while the bandwidth premium of kilobyte digests inverts in
-our favor beyond $N \approx 2000$.
+collision-resistant hashes, which reveal whether two views differ but not
+by how much. We study what a protocol gains from measuring \emph{how much},
+and what it must never do with that measurement. The measurement is a
+Rademacher sketch: each transaction maps to a pseudorandom vector in
+$\{-1,+1\}^{n}$ and a set to the integer sum, so the squared distance
+between two sketches over $n$ is an unbiased estimate of the symmetric
+difference (the AMS tug-of-war estimator). We show that this sketch
+cannot be binding at any modulus, because its sums never wrap, and pair
+it with an LtHash accumulator that is; one ledger digest carries both.
+We then give an explicit polynomial-time attack that makes an arbitrarily
+large difference read as roughly a dozen transactions at $n = 512$, which
+settles where estimation belongs: scheduling, synchronization, and
+monitoring, never safety. On a two-phase locking BFT core with view
+change we add a speculative one-round fast path at the quorum
+$\lceil (n + 3f + 1)/2 \rceil$, prove and fuzz its safety (0 violations
+in 50,000 adversarial executions), and show that the $2f+1$ fast path of
+our earlier version is unsafe across view changes (about 4\% of fuzzed
+executions decide conflicting values). Around the core we build readiness
+sensing, partition detection and healing, $O(\log H)$ fork localization,
+and a cross-shard conservation invariant that detects dropped, replayed,
+minted, and misrouted credits exactly and localizes them by group
+testing. An honest evaluation against HotStuff, HotStuff-2, chained
+HotStuff, and Kauri finds no message or bandwidth advantage: the
+augmentation costs about $46\%$ more bytes than HotStuff-2 at
+$N = 1000$ and concentrates load on the leader. What it buys is
+visibility into who is behind, by how much, and where, at a price we
+report exactly.
 \end{abstract}
 
 \begin{IEEEkeywords}
-Byzantine fault tolerance, consensus, multiset hashing, sketching, set
-reconciliation, sharding, blockchain.
+Byzantine fault tolerance, consensus, sketching, homomorphic hashing,
+set reconciliation, sharding, fast path.
 \end{IEEEkeywords}
 
 \IEEEpeerreviewmaketitle
@@ -90,939 +84,827 @@ reconciliation, sharding, blockchain.
 \section{Introduction}
 \label{sec:intro}
 
-\IEEEPARstart{B}{yzantine} fault tolerant consensus has been built on
-collision-resistant hashing since PBFT~\cite{castro1999pbft}. Collision
-resistance is the right property for preventing forgery and exactly the
-wrong property for measuring agreement: when two validators hash their
-transaction sets and the hashes differ, the protocol learns one bit, not
-identical, whether the sets differ by one transaction or by half. Three
-structural costs follow. Validators must synchronize state before they can
-vote; agreement quality is unmeasurable until votes are counted, so
-protocols such as HotStuff~\cite{yin2019hotstuff} run every voting round
-even under unanimous agreement; and hierarchical designs need committees
-large enough to run independent BFT, which is why Ethereum's attestation
-committees hold 128 validators~\cite{eth2spec} and why cross-shard
-transactions settle through per-transaction coordination.
+\IEEEPARstart{W}{hen} two validators hash their transaction sets and
+the hashes differ, a BFT protocol learns one bit. It does not learn
+whether one transaction is missing or half the block, whether one
+validator is behind or the network has split in two, or which of sixty
+cross-shard corridors lost a credit. Modern protocols route around this
+blindness well. HotStuff~\cite{yin2019hotstuff} and
+HotStuff-2~\cite{malkhi2023hotstuff2} vote on block hashes after
+dissemination; DAG protocols such as Narwhal~\cite{narwhal},
+Bullshark~\cite{bullshark}, and Autobahn~\cite{giridharan2024autobahn}
+separate data availability from ordering so that votes never wait on
+mempool convergence. None of them, however, can \emph{observe}
+disagreement short of reconciling it, and several decisions would
+benefit from observation: when to propose so that a one-round fast path
+will fire, whom to synchronize first, whether a stall is a slow
+validator or a partition, and which shard pair broke settlement.
 
-The obvious repair, replacing the hash with a similarity-preserving
-digest, runs into an equally obvious objection: a digest that maps nearby
-sets to nearby values cannot be collision-resistant, so nothing it says
-can be trusted against an adversary. Our starting point is that this
-objection, made precise, is not a refutation but a design rule. We prove
-that for \emph{any} distance-preserving multiset hash, digest proximity is
-unbindable: an adversary can always exhibit sets within any threshold that
-differ in ways a protocol cares about, because the distance property
-itself guarantees it (Theorem~\ref{thm:impossible}). The conclusion is not
-to abandon estimation but to route it away from safety. Estimation gates
-\emph{scheduling}: when to propose, whom to synchronize, when to take an
-optimistic path. Security remains what it always was: a quorum of
-signatures on a collision-resistant hash. We formalize this separation and
-prove it composes: any BFT protocol whose commit predicate is a signature
-quorum retains its safety argument verbatim when an estimation layer is
-added (Theorem~\ref{thm:compose}).
+This article asks what a protocol gains from a cheap, mergeable
+measurement of disagreement, and what it must never do with one. The
+answers are deliberately conservative, and several of them correct our
+earlier work~\cite{mercier2026proxima}.
 
-What makes the separation productive rather than merely safe is that a
-single object serves both sides of it. Our distance-preserving multiset
-hash (DPMH) digests a transaction multiset by summing per-transaction
-Rademacher vectors, giving three properties no collision-resistant hash
-offers: the squared digest distance is an unbiased estimator of the
-multiset symmetric difference; digests add and subtract, so groups,
-histories, and in-flight sets have exact one-object summaries; and the
-same additive structure over a modulus is a homomorphic accumulator whose
-equality is collision-binding under a short-integer-solution (SIS)
-assumption, the algebra behind Ajtai hashing~\cite{ajtai1996sis} and
-deployed in Facebook's LtHash~\cite{lewi2019lthash}. Estimation uses the
-geometry; security uses only equality; the impossibility theorem says this
-division of labor is forced, and the construction says it is cheap: one
-SHA-512 and $n$ integer additions per transaction, one kilobyte on the
-wire.
+\textbf{The measurement and its limits (Sections~\ref{sec:primitive},
+\ref{sec:security}).} The measurement is the AMS tug-of-war
+sketch~\cite{ams1996} with random-oracle signs: a set's sketch is the
+integer sum of per-item $\pm 1$ vectors, and squared sketch distance over
+$n$ is an unbiased estimate of the symmetric difference. The estimator is
+classical; PBS~\cite{gong2020pbs} already uses it to size set
+reconciliation. Our first observation concerns binding: because every
+coordinate of a $\pm 1$ sum is bounded by the item count, reducing modulo
+$q$ never wraps for any realistic set, a modular collision \emph{is} an
+integer collision, and the modulus contributes nothing. The lattice
+analyses that protect LtHash~\cite{lewi2019lthash} therefore do not
+transfer. We keep the sketch for estimation only and pair it with a
+uniform-coordinate LtHash accumulator for equality; a ledger digest
+carries both. Our second observation concerns robustness: an adversary
+who knows the salt and chooses which side of a difference each new item
+lands on can make any number of differing items read as a constant. At
+$n = 512$, greedy balancing over 256 candidates per step holds the
+estimate near 14 whether the true difference is 200 or 1600
+(Fig.~\ref{fig:deflation}). This is an explicit, measured instance of
+known impossibility results for sketches under adversarial
+inputs~\cite{mironov2011sketching,ajtai2022whitebox,hardt2013robust}, and
+it fixes the architecture: estimates may gate scheduling,
+synchronization, and monitoring, and must fail soft everywhere.
 
-We rebuild the Proxima protocol of our conference
-paper~\cite{mercier2026proxima} on this foundation and find that every
-protocol mechanism sharpens:
+\textbf{A safe fast path (Section~\ref{sec:consensus}).} Estimation
+earns its keep where it decides \emph{when} to try something optimistic.
+Our earlier version finalized in one round once $2N/3$ validators signed
+a proposal. That rule is safe within a view and unsafe across views: a
+fast decision seen by one honest validator can be invisible to the next
+leader. We place the fast path on a two-phase locking core with view
+change, use the fast quorum $\nf = \lceil (n + 3f + 1)/2 \rceil$ of
+FaB~\cite{martin2006fab} and SBFT~\cite{gueta2019sbft}, and give the
+view-change rule that recovers fast decisions. Our fuzzer, which plays
+equivocating leaders, double-voting replicas, and adversarial
+scheduling, finds conflicting decisions in about 4\% of executions of
+the $2f+1$ rule and none in 50,000 executions of the corrected protocol.
+It also found a bug in our own first draft of the corrected rule
+(Section~\ref{sec:consensus}). At optimal resilience $n = 3f + 1$ the
+safe fast quorum is all $n$ validators; the fast path is useful when the
+configured $f$ is below $n/3$.
 
-\begin{itemize}
-\item \textbf{Unbiased estimation (Sec.~\ref{sec:primitive}).} The
-conference version used nonnegative coordinates, whose distance signal
-depends on the direction of the difference: substituting $j$ transactions
-reads at a fraction of its true size and can hide below honest stragglers.
-Zero-mean coordinates measure exactly the symmetric difference
-(Lemma~\ref{lem:unbiased}), the clustering threshold becomes the closed
-form $\tau^{2} = 3n$ with honest-exclusion probability $e^{-n/8}$, and
-Monte Carlo calibration is demoted to a validation check.
-\item \textbf{Honest-sufficient fast path
-(Sec.~\ref{sec:augment}).} Speculative signed commitments collected in
-round one form a finality certificate identical to the slow-path object,
-so the fast path is covered by the safety theorem verbatim; and because
-the trigger counts signatures rather than testing a variance statistic,
-one in-cluster Byzantine validator can no longer disable it. In
-simulation the prior trigger's fast-path rate falls from 100\% to 0\% at
-a single mimicking adversary; ours is unaffected
-(Fig.~\ref{fig:fastpath}).
-\item \textbf{Byzantine-robust reference (Sec.~\ref{sec:augment}).} The
-clustering reference becomes the coordinate-wise median of the submitted
-digests, verifiable by any validator, with breakdown point $1/2$ per
-coordinate. Under a coordinated drag attack with a Byzantine aggregator,
-the prior aggregator-chosen reference excludes 100\% of honest validators;
-the median excludes none up to 45\% corruption (Fig.~\ref{fig:reference}).
-\item \textbf{Readiness sensing (Sec.~\ref{sec:augment}).} Digests
-piggybacked on gossip let the proposer measure convergence and propose
-when a quorum already matches, converting fast-path engagement from
-weather, $(1-p_{\mathrm{miss}})^{N}$, into a controlled quantity: at 80\%
-initial miss rate, fixed-interval proposal never engages the fast path
-and sensing engages it in every trial at a mean delay of $3.4$ gossip
-ticks (Fig.~\ref{fig:fastpath}).
-\item \textbf{Estimate-then-decode synchronization
-(Sec.~\ref{sec:protocol}).} The digest distance sizes an invertible Bloom
-lookup table~\cite{goodrich2011iblt} that recovers exactly the differing
-transactions, replacing the conference version's Bloom filters and their
-false-positive liveness channel. The same two-syndrome pattern heals
-partitions at cost proportional to divergence and, with cumulative
-accumulators, localizes chain forks in exactly $\log_{2} H + 1$ probes.
-\item \textbf{Conservation sharding (Sec.~\ref{sec:conservation}).}
-Cross-shard settlement becomes double-entry bookkeeping in vector space:
-outbound and inbound corridor accumulators must sum to equality, a
-collision-binding invariant checked with $O(S)$ kilobyte objects per
-block regardless of volume. Violations are localized to faulty corridors
-by group testing in $O(f \log C)$ signed probes and resolved exactly by
-corridor syndromes: in a 16-shard run with 9 injected faults the
-invariant's violation norm estimated $8.9$ dangling effects, aging alarms
-and bisection named exactly the 2 faulty corridors in 15 probes, and the
-decode recovered every dropped and minted transaction.
-\end{itemize}
+\textbf{Observability (Sections~\ref{sec:observe}, \ref{sec:conservation}).}
+On that core the sketch supports readiness sensing (propose when the
+gossiped sketches say \nf\ validators already hold the block), partition
+detection from bimodal sketch clouds with healing at cost proportional to
+the divergence, $O(\log H)$ fork localization on prefix accumulators, and
+a cross-shard conservation invariant. The last is double-entry
+bookkeeping with homomorphic digests: outbound and inbound corridor
+accumulators must balance once a settlement window has passed. Keying
+items by corridor and indexing them by debit height makes detection exact
+for dropped, replayed, minted, and misrouted credits and immune to honest
+settlement lag, and group testing localizes faulty corridors.
 
-Sections~\ref{sec:related} through~\ref{sec:model} position and set up the
-work; Sections~\ref{sec:primitive} and~\ref{sec:security} define the
-primitive and its security envelope; Sections~\ref{sec:augment}
-through~\ref{sec:conservation} build the protocol layer; and
-Section~\ref{sec:eval} evaluates every claim against HotStuff,
-HotStuff-2~\cite{malkhi2023hotstuff2}, Kauri~\cite{kauri}, and PBFT, with
-the honest costs (a bandwidth premium at small $N$, a simulation-only
-Kauri model, open cryptanalysis at exact parameters) stated where they
-arise.
+\textbf{An honest evaluation (Section~\ref{sec:eval}).} Our earlier
+version reported message counts $2\times$ below HotStuff. Under one
+shared cost model, with certificates delivered to every validator and
+stragglers fetching missing transactions by id, the augmented protocol
+sends as many messages as HotStuff-2, about 46\% more bytes at
+$N = 1000$, and loads its leader more; chained HotStuff is the cheapest
+protocol we measured. Conservation verification is cheaper than
+per-corridor batch roots only on dense corridor graphs (from 34 shards on
+a full mesh). We report these results because they locate the
+contribution correctly: observability, not efficiency.
+
+All code, the 59 executable checks, and the script that produces every
+figure and number are public, and results are bit-reproducible.
 
 %============================================================================
 \section{Related Work}
 \label{sec:related}
 
-\textbf{BFT consensus and speculation.} PBFT~\cite{castro1999pbft}
-established practical BFT at $O(N^{2})$ messages;
-HotStuff~\cite{yin2019hotstuff} reached linearity with leader-based
-aggregation and threshold signatures, HotStuff-2~\cite{malkhi2023hotstuff2}
-removed one of its three phases, and Tendermint~\cite{buchman2016tendermint}
-offers a similar structure. All compare state by collision-resistant hash
-and synchronize fully before voting. Our fast path descends from
-speculative execution in Zyzzyva~\cite{kotla2007zyzzyva} and
-SBFT~\cite{gueta2019sbft}, where optimistically collected signatures
-finalize early when a large enough quorum already agrees; our contribution
-is not the speculation but the estimation layer that decides when to
-attempt it and the theorem that such layers cannot harm safety.
+\textbf{BFT and fast paths.} PBFT~\cite{castro1999pbft} established
+practical BFT; HotStuff~\cite{yin2019hotstuff} made it linear with
+leader-based aggregation, HotStuff-2~\cite{malkhi2023hotstuff2} removed a
+phase, and Tendermint~\cite{buchman2016tendermint} has a similar locking
+structure. One-round decisions descend from FaB
+Paxos~\cite{martin2006fab}, Zyzzyva~\cite{kotla2007zyzzyva}, and
+SBFT~\cite{gueta2019sbft}; Kuznetsov, Tonkikh, and
+Zhang~\cite{kuznetsov2021fast} settle the resilience needed for
+two-step Byzantine consensus. Our fast-path quorum and view-change rule
+follow this line; our contribution is the estimation layer that decides
+when to attempt it, and a correction of our own earlier rule.
 
-\textbf{Hierarchical and DAG designs.} Kauri~\cite{kauri} pipelines
-tree-based dissemination and aggregation over HotStuff but keeps
-per-group, hash-based voting, hence groups large enough for Byzantine
-tolerance; Ethereum's 128-validator committees~\cite{eth2spec} exist for
-the same reason. Distance filtering removes the per-group vote, so our
-tree runs on groups of ten. Narwhal/Tusk~\cite{narwhal} and
-Bullshark~\cite{bullshark} decouple data availability from ordering over
-partial views; digests could measure vertex agreement there, which we
-leave open.
+\textbf{Dissemination and DAG protocols.} Narwhal~\cite{narwhal},
+Bullshark~\cite{bullshark}, and Autobahn~\cite{giridharan2024autobahn}
+decouple data availability from consensus, so validators vote on
+certified batches rather than on synchronized mempools. This removes the
+throughput cost that motivated our earlier version and is the main reason
+we no longer claim efficiency. Observability composes with these designs:
+the same sketches can summarize which certified batches a validator
+holds. Kauri~\cite{kauri} aggregates over trees with reconfiguration
+on relay failure; our tree mode uses the same fallback.
 
-\textbf{Multiset hashing and sketches.} Additive multiset hashes go back
-to AdHash~\cite{bellare1997adhash}, broken into enormous moduli by
-Wagner's generalized birthday attack~\cite{wagner2002gbp}, and were
-formalized by Clarke et al.~\cite{clarke2003multiset}; the vectorized
-form we use is deployed as LtHash~\cite{lewi2019lthash}, whose SIS-style
-analysis~\cite{ajtai1996sis} we inherit. The estimation side is the
-AMS/Tug-of-War sketch~\cite{ams1996} specialized to multiset indicator
-vectors. What we add is the observation that one object carries both
-properties at once, a quantitative adversarial-deflation analysis in the
-public-hash setting with the two-domain design it forces, and the
-consensus layer built on top. Hardt and Woodruff~\cite{hardt2013robust}
-proved linear sketches are not robust to adaptive adversaries; our
-impossibility theorem is the public-coin multiset-hash analogue, and our
-composition theorem is the architectural answer. Locality-sensitive
-hashing~\cite{indyk1998lsh,simhash,minhash,pstable} solves nearest
-neighbors, not summable state comparison; we do not use it.
+\textbf{Multiset hashing.} Additive multiset hashes start with
+AdHash~\cite{bellare1997adhash}, whose moduli Wagner's generalized
+birthday attack~\cite{wagner2002gbp} forces to be large; Clarke et
+al.~\cite{clarke2003multiset} formalize incremental multiset hashing, and
+LtHash~\cite{lewi2019lthash} vectorizes it over $\mathbb{Z}_{2^{16}}^{1024}$
+with an SIS-style analysis~\cite{ajtai1996sis}. LtHash is deployed for
+update propagation at Meta and as Solana's accounts hash~\cite{simd0215},
+so homomorphic ledger digests inside consensus are not new. Uniform
+coordinates make LtHash differences uniform, hence distance-free; this is
+why we carry a separate sketch.
 
-\textbf{Set reconciliation.} Exact reconciliation descends from
-characteristic polynomials~\cite{minsky2003} through invertible Bloom
-lookup tables~\cite{goodrich2011iblt}, Graphene~\cite{ozisik2019graphene},
-minisketch as deployed in Bitcoin's Erlay~\cite{naumenko2019erlay}, and
-rateless IBLTs~\cite{yang2024rateless}. Erlay is the existence proof that
-set reconciliation belongs inside blockchain protocols; we generalize its
-role from transaction relay to consensus synchronization, fork healing,
-and cross-shard resolution, with the digest supplying the size estimate
-that the decoder needs.
+\textbf{Sketches under adversaries.} The estimator is the AMS
+sketch~\cite{ams1996} applied to set indicators. Mironov, Naor, and
+Segev~\cite{mironov2011sketching} study sketching when the adversary
+knows the public randomness; Ajtai et al.~\cite{ajtai2022whitebox} prove
+that white-box adversaries force linear space for $F_{2}$ approximation
+and show computational assumptions can restore robustness; Hardt and
+Woodruff~\cite{hardt2013robust} show linear sketches fail under adaptive
+queries. Robust property-preserving
+hashing~\cite{boyle2019pph,fleischhacker2021pph,holmgren2022pph} gives
+hashes whose distance predicates hold against adversaries, at output
+sizes growing with the threshold; Holmgren et al.\ pair a decodable
+syndrome with a homomorphic collision-resistant hash, the same pattern
+as our estimate-then-decode synchronization. Our deflation attack is a
+concrete, measured instance in the public-salt setting; we claim no new
+impossibility.
 
-\textbf{Robust aggregation.} Coordinate-wise medians and trimmed means
-with Byzantine breakdown guarantees come from robust distributed
-learning~\cite{blanchard2017krum,yin2018robust}; we import them as
-reference selection for clustering, which to our knowledge is new in
-consensus.
+\textbf{Set reconciliation.} Characteristic
+polynomials~\cite{minsky2003}, IBLTs~\cite{goodrich2011iblt}, the Strata
+estimator~\cite{eppstein2011strata}, Graphene~\cite{ozisik2019graphene},
+Erlay~\cite{naumenko2019erlay}, and PBS~\cite{gong2020pbs} cover exact
+reconciliation and difference estimation; rateless
+IBLTs~\cite{yang2024rateless}, CertainSync~\cite{keniagin2025certainsync},
+and self-measuring IBLTs~\cite{wu2026ibltmeasure} remove the need for a
+separate estimate. Range-based reconciliation~\cite{meyer2023rbsr} bisects
+monoid fingerprints, the structure of our fork localization. Dold and
+Grothoff~\cite{dold2017setunion} run estimate-then-reconcile inside
+Byzantine set-union consensus.
 
-\textbf{Sharding.} Ethereum moved to data-availability sharding
-(Danksharding~\cite{danksharding}); NEAR's Nightshade~\cite{nightshade}
-settles with receipts whose volume tracks transaction volume. Our
-conservation invariant is complementary to both: constant-size settlement
-verification with fraud localization, not an execution-ordering
-mechanism.
+\textbf{Robust location and gossip.} Coordinate-wise medians come from
+Byzantine-robust learning~\cite{blanchard2017krum,yin2018robust} and
+multidimensional approximate agreement~\cite{mendes2013approx}; push-sum
+gossip~\cite{kempe2003gossip} computes the averages our sketches admit.
+
+\textbf{Sharding.} Receipt-based settlement~\cite{nightshade} carries
+metadata proportional to volume; data-availability
+sharding~\cite{danksharding} addresses a different layer. We found no
+prior use of homomorphic accumulators as a cross-shard conservation
+check.
 
 %============================================================================
-\section{System Model}
+\section{Model}
 \label{sec:model}
 
-We consider $N$ validators, at most $f < N/3$ Byzantine, behaving
-arbitrarily and coordinating; honest validators follow the protocol. We
-assume partial synchrony~\cite{dwork1988partialsync}: after an unknown
-global stabilization time, messages between honest validators arrive
-within a known bound. Each validator holds a BLS~\cite{boneh2004bls} key
-pair with public keys known to all; signatures aggregate ($N$ signatures
-into one 96-byte aggregate), and we assume CDH hardness in
-BLS12-381~\cite{blst}. Communication runs through an aggregator (flat
-mode) or a tree of relays (tree mode); the role rotates every round, and a
-Byzantine aggregator can suppress messages, which costs liveness, but
-cannot forge signatures. The adversary is static, corrupting validators
-before the protocol begins; it observes the full network and may grind
-transactions (Section~\ref{sec:security}). SHA-512 is modeled as a random
-oracle. Honest validators may receive transactions with delay relative to
-the proposer; $p_{\mathrm{miss}}$ denotes the per-validator probability of
-an incomplete view at proposal time, and an incomplete honest view misses
-at most $k_{\max} = 2$ transactions. Blocks are sets: multiplicity within
-a block is bounded by one and enforced at validation.
+There are $n$ validators, at most $f$ Byzantine, with $n \ge 3f + 1$;
+the adversary is static and coordinates the Byzantine validators.
+Communication is partially synchronous~\cite{dwork1988partialsync}.
+Validators hold BLS~\cite{boneh2004bls} keys over BLS12-381; signatures
+on the same message aggregate. SHA-512 and SHAKE-256 are random oracles.
+A proposal lists the ids of its transactions; an honest validator that
+lacks some of them when the proposal arrives (probability
+$p_{\mathrm{miss}}$, a swept parameter, missing at most $k_{\max} = 2$)
+fetches them by id from the leader before voting. A block is a set and
+validation rejects duplicates.
 
 %============================================================================
-\section{The Primitive}
+\section{The Ledger Digest}
 \label{sec:primitive}
 
-\subsection{Construction}
+\subsection{Estimation: the Rademacher sketch}
 
-For round (height) $h$, the per-transaction vector is
-\begin{equation}
-v_{h}(tx) \;=\; \mathrm{sgn}\bigl(H(\textsf{dom} \,\|\, h \,\|\,
-tx)\bigr) \;\in\; \{-1,+1\}^{n},
-\end{equation}
-where $H$ is SHA-512, $\mathrm{sgn}$ maps each of the first $n$ output
-bits $b$ to $2b - 1$, and $\textsf{dom}$ is a domain-separation tag. For
-$n = 512$ one hash invocation suffices. The digest of a multiset $T$ is
-the coordinate-wise integer sum
-\begin{equation}
-D_{h}(T) \;=\; \sum_{tx \in T} v_{h}(tx),
-\end{equation}
-stored as $n$ signed 16-bit words: each transaction moves each coordinate
-by exactly one, so for any block with $|T| \le 32767$ the mod-$2^{16}$
-encoding equals the integer digest with no wraparound. Homomorphism is
-immediate in both directions, $D(A \uplus B) = D(A) + D(B)$ and
-$D(A) - D(B)$ is meaningful, and group summaries travel as exact integer
-pairs (sum of digests, total weight) so that no floating point ever
-enters the protocol, eliminating cross-platform float nondeterminism as a
-bug class. Computation is one SHA-512 plus $n$ integer additions per
-transaction and one $O(n)$ dot product per distance.
+With salt $s$, each item $x$ maps to
+$v_{s}(x) = \mathrm{sgn}(H(\textsf{dom} \,\|\, s \,\|\, x)) \in
+\{-1,+1\}^{n}$, the first $n$ bits of SHA-512 mapped to $\pm 1$, and a
+set $T$ to $D_{s}(T) = \sum_{x \in T} v_{s}(x)$, computed over the
+integers and sent as $n$ 16-bit words ($n = 512$, 1\,KB). Sketches add,
+subtract, and aggregate exactly; no floating point enters any decision.
 
-Two domains coexist, and Section~\ref{sec:security} shows why both are
-needed. \emph{Round digests} are salted by height ($\textsf{dom} =
-\textsf{PXM/round}$, $q = 2^{16}$, $n = 512$) and feed clustering,
-sensing, and synchronization. \emph{Ledger accumulators} use a fixed salt
-($\textsf{dom} = \textsf{PXM/ledger}$, $q = 2^{32}$) and feed cumulative
-chain digests $P[b] = \sum_{b' \le b} D(\text{block}_{b'})$, conservation
-invariants, and fork localization, where equality must be binding and
-algebra must compose across heights. Table~\ref{tab:params} lists the
-profiles.
-
-\begin{table}[t]
-\caption{Parameter profiles. RSE is the relative standard error of the
-symmetric-difference estimate; exclusion is the probability that an
-honest validator with $d \le 2$ exceeds $\tau^{2} = 3n$.}
-\label{tab:params}
-\centering
-\small
-\begin{tabular}{@{}lrrrrl@{}}
-\toprule
-profile & $n$ & $q$ & wire & RSE & honest excl.\\
-\midrule
-round & 512 & $2^{16}$ & 1024\,B & $\le 6.3\%$ & $e^{-64}$\\
-light & 128 & $2^{16}$ & 256\,B & $\le 12.5\%$ & $e^{-16}$\\
-ledger & 512 & $2^{32}$ & 2048\,B & exact$^{\dagger}$ & n/a\\
-\bottomrule
-\end{tabular}
-\vspace{2pt}
-
-{\raggedright\footnotesize $^{\dagger}$Distance on accumulator
-differences is exact below $q/2 = 2^{31}$ divergent transactions;
-equality binding is unaffected by saturation.\par}
-\end{table}
-
-\subsection{Unbiased Distance Estimation}
-
-Throughout this subsection the two multisets are fixed before the oracle
-is queried; the adversarial regime is Section~\ref{sec:security}.
-
-\begin{lemma}[Unbiased symmetric-difference estimator]
+\begin{lemma}[AMS estimator for sets]
 \label{lem:unbiased}
-Let $d = |A \,\triangle\, B|$ and $\dd = D(A) - D(B)$. Then $\dd$ is
-distributed as a sum of $d$ i.i.d.\ uniform $\{-1,+1\}^{n}$ vectors, and
-\begin{equation}
-\mathbb{E}\bigl[\norm{\dd}^{2}\bigr] = nd, \qquad
-\hat{d} := \norm{\dd}^{2}/n \text{ is unbiased},
-\end{equation}
-with $\operatorname{Var}(\hat{d}) = 2d(d-1)/n$, hence relative standard
-error at most $\sqrt{2/n}$ ($6.25\%$ at $n = 512$).
+For sets $A, B$ fixed before $s$ is revealed, with $d = |A \triangle B|$
+and $\dd = D_{s}(A) - D_{s}(B)$, the estimate $\hat d = \norm{\dd}^{2}/n$
+satisfies $\mathbb{E}[\hat d] = d$ and $\operatorname{Var}(\hat d) =
+2d(d-1)/n$, so its relative standard error is at most $\sqrt{2/n}$. For
+multisets with multiplicity difference $c$, $\mathbb{E}[\hat d] =
+\norm{c}_{2}^{2}$, not $\norm{c}_{1}$.
 \end{lemma}
 
 \begin{IEEEproof}
-Vectors of elements in $A \cap B$ cancel in $\dd$; the remaining $d$
-vectors appear with signs $\pm 1$, which the symmetry of the Rademacher
-distribution absorbs. Per coordinate, $S = \sum_{i=1}^{d} \varepsilon_{i}$
-with $\varepsilon_{i}$ i.i.d.\ Rademacher has $\mathbb{E}[S] = 0$,
-$\mathbb{E}[S^{2}] = d$, and $\mathbb{E}[S^{4}] = 3d^{2} - 2d$. Summing
-$\mathbb{E}[S^{2}]$ over $n$ independent coordinates gives
-$\mathbb{E}\norm{\dd}^{2} = nd$; the variance of $\norm{\dd}^{2}$ is
-$n(\mathbb{E}[S^{4}] - \mathbb{E}[S^{2}]^{2}) = n(2d^{2} - 2d)$, and
-dividing by $n^{2}$ yields the claim.
+Items in $A \cap B$ cancel; the $d$ remaining vectors enter with fixed
+signs, and the coordinates of $\dd$ are independent sums of $d$
+Rademacher variables $S$ with $\mathbb{E}S^{2} = d$ and $\mathbb{E}S^{4} =
+3d^{2} - 2d$. Summing over $n$ coordinates gives the mean $nd$ and
+variance $n(2d^{2} - 2d)$ of $\norm{\dd}^{2}$. With multiplicities the
+per-coordinate sum is $\sum_{i} c_{i}\varepsilon_{i}$, whose second
+moment is $\norm{c}_{2}^{2}$.
 \end{IEEEproof}
 
-Two consequences shape the protocol. First, direction independence:
-substituting $j$ transactions is a symmetric difference of $2j$ and is
-measured as such, where the nonnegative coordinates of the conference
-version~\cite{mercier2026proxima} let substitutions partially cancel and
-read below honest stragglers. Second, exact small-$d$ laws that serve as
-implementation test vectors: at $d = 1$, $\norm{\dd}^{2} = n$
-deterministically (a singleton difference is certified by the exact value
-$n$, with zero variance); at $d = 2$, $\norm{\dd}^{2} \sim 4\,
-\mathrm{Bin}(n, 1/2)$; at $d = 3$, $\norm{\dd}^{2} \sim n + 8\,
-\mathrm{Bin}(n, 1/4)$. Coordinates are independent, so Hoeffding also
-gives the crude tail $\Pr[\,|\norm{\dd}^{2} - nd| \ge nt\,] \le
-2\exp(-2nt^{2}/d^{4})$ for larger $d$.
+The small-$d$ laws are exact and serve as test vectors: $\norm{\dd}^{2}
+= n$ at $d = 1$; $4\,\mathrm{Bin}(n, 1/2)$ at $d = 2$; $n +
+8\,\mathrm{Bin}(n, 1/4)$ at $d = 3$. A substitution of $j$ items reads as
+$2j$ (Fig.~\ref{fig:estimator}); the nonnegative coordinates of our
+earlier version let substitutions partially cancel.
 
-\subsection{Closed-Form Threshold}
-\label{sec:threshold}
+\textbf{Straggler threshold.} The integer test $\norm{\dd}^{2} \le 3n$
+classifies \emph{honest} divergence from a reference. Computing the
+distributions exactly (Fig.~\ref{fig:threshold}), an honest view with
+$d = 2$ exceeds $3n$ with probability $1.6 \times 10^{-31}$ (Hoeffding
+gives $e^{-n/8}$; the deviation is $n/4$ binomial units), a view with
+$d = 4$ falls at or below it with probability $4.9 \times 10^{-7}$, and
+$d = 3$ is a coin flip ($0.48$ above). At $n = 128$ the corresponding
+values are $2.1 \times 10^{-9}$ and $8.3 \times 10^{-3}$. The threshold
+says nothing about Byzantine validators, who can submit any vector,
+including the reference itself.
 
-An honest validator with an incomplete view misses at most $k_{\max} = 2$
-transactions, so its digest sits at squared distance concentrated on
-$nd \le 2n$ from the full-state digest. We therefore cluster at
-\begin{equation}
-\tau^{2} \;=\; 3n .
-\end{equation}
-Honest exclusion at $d = 2$ requires $4\,\mathrm{Bin}(n,1/2) > 3n$, i.e.,
-a binomial deviation of $n/8$ above its mean, of probability at most
-$e^{-n/8}$ ($e^{-64} \approx 1.6 \times 10^{-28}$ at $n = 512$); at
-$d = 1$ exclusion is impossible since $n < 3n$. A fabrication at $d = 4$
-sits $4.6$ standard deviations above the threshold. The value $d = 3$ is
-genuinely ambiguous and is resolved by synchronization plus the signature
-phase, never by the estimator; this ambiguity is inherent to any
-finite-variance estimator and costs at most one round, never safety. The
-conference version calibrated its threshold by Monte Carlo; here the
-threshold is analytic and the simulation is only a validation check
-(Section~\ref{sec:eval}).
+\textbf{Salts.} Round sketches are salted with the height and the
+previous block hash, which nobody knows before the previous block is
+final, so no table can be built in advance. Lemma~\ref{lem:unbiased}
+requires the sets to be fixed before the salt is known; where a party
+chooses its set after seeing the salt, the estimate is advisory
+(Section~\ref{sec:security}).
+
+\subsection{Binding: why the sketch cannot do it}
+
+A ledger needs an accumulator whose equality is binding: prefix digests
+for fork localization, conservation checks, and prune accounting
+(a node proves it pruned exactly $P$ by showing $D(\mathrm{before}) -
+D(\mathrm{after}) = D(P)$). Our earlier drafts used the sketch modulo
+$q = 2^{32}$ and appealed to the SIS analysis of LtHash. That appeal
+fails.
+
+\begin{proposition}[The modulus is inert]
+\label{prop:inert}
+Let $V$ be any matrix with entries in $\{-1, +1\}$ and $z$ an integer
+vector with $\norm{z}_{1} < q/2$. Then $Vz \equiv 0 \pmod q$ if and only
+if $Vz = 0$ over $\mathbb{Z}$.
+\end{proposition}
+
+\begin{IEEEproof}
+Each coordinate of $Vz$ has absolute value at most $\norm{z}_{1} < q/2$,
+and the only multiple of $q$ in $(-q/2, q/2)$ is $0$.
+\end{IEEEproof}
+
+Every collision between realistic sets has $\norm{z}_{1} < 2^{31}$, so
+binding for the sketch is the problem of finding a signed subset of
+random $\pm 1$ vectors that sums to zero over the integers. Lattice
+reduction is not the cheapest attack here; a generalized-birthday attack
+over integer sums is, and a first-cut estimate puts it near $2^{110}$
+work when long histories allow large solution weights, far below the
+$n \log_{2} q$ budget the earlier text implied. We did not pursue
+refinements. Instead the ledger digest binds with LtHash: each item
+expands through SHAKE-256 to a uniform vector in
+$\mathbb{Z}_{2^{16}}^{1024}$, exactly the parameters analyzed by Lewi et
+al.~\cite{lewi2019lthash}, whose security argument applies to sets
+verbatim. A \emph{ledger digest} is the pair (LtHash, sketch): both are
+linear, equality is decided by LtHash alone, and the sketch reports how
+large a difference is. It costs 4\,KB on the wire (2\,KB each).
 
 %============================================================================
-\section{Security of the Primitive}
+\section{What the Sketch Cannot Promise}
 \label{sec:security}
 
-\subsection{Equality Binding}
-\label{sec:binding}
+\begin{proposition}[Greedy deflation]
+\label{prop:deflate}
+An adversary who knows the salt can produce sets $X, Y$ with
+$|X \triangle Y| = m$ for any $m$ such that $\norm{D(X) - D(Y)}^{2}/n$
+stays below a level that depends on $n$ and the adversary's per-step
+search budget $K$ but not on $m$, using $mK$ hash evaluations.
+\end{proposition}
 
-A collision for the accumulator is a pair of distinct bounded-multiplicity
-multisets with equal digests mod $q$, equivalently a nonzero integer
-vector $z$ with bounded entries and bounded support such that $Vz \equiv 0
-\pmod q$, where the columns of $V$ are the oracle-derived $\pm 1$ vectors
-of the ground set. This is a short-integer-solution instance with a
-$\pm 1$ matrix, the algebra of Ajtai hashing~\cite{ajtai1996sis} and of
-LtHash~\cite{lewi2019lthash}. Collisions exist by pigeonhole, as they must
-for any compressing homomorphic hash; security is the claim that finding
-one is infeasible. Wagner's $k$-tree attack~\cite{wagner2002gbp} over
-$\mathbb{Z}_{q}^{n}$ must cancel $n \log_{2} q = 8192$ constraint bits and
-produces solutions of Hamming weight $2^{a}$ using lists of cost roughly
-$2^{8192/(a+1)}$; the block-size cap $|T| \le 2^{15}$ forces $a \le 15$
-and per-list cost $2^{512}$. Lattice attacks must find vectors in the
-$q$-ary kernel lattice of $V$ far shorter than the Gaussian heuristic at
-these parameters. We state binding as a reduction shape with these
-first-cut estimates and inherit the parameter analysis of
-LtHash~\cite{lewi2019lthash} at the same $n \log q$ budget; a dedicated
-cryptanalysis at our exact parameters is open
-(Section~\ref{sec:limits}), and we claim no concrete security level
-without it.
+The construction keeps the running difference $S = D(X) - D(Y)$; at each
+step it draws $K$ fresh items and adds the one, to whichever side, that
+most reduces $\norm{S}$. A random vector's inner product with $S$ has
+spread about $\norm{S}$, so each step removes roughly the squared
+maximum of $K$ such products and adds $n$; the two balance at a
+steady-state norm independent of $m$. Fig.~\ref{fig:deflation} measures
+it at $n = 512$: with $K = 256$ the estimate stays between 11 and 14 for
+true differences from 50 to 1600; even $K = 1$, where the adversary only
+chooses the side, plateaus near 180. The pair-grinding analysis in our
+earlier drafts, which bounded deflation to constant factors at
+exponential cost, considered the wrong attack.
 
-\subsection{Adversarial Deflation and the Two Domains}
-\label{sec:deflation}
+\begin{figure}[t]
+\centering
+\includegraphics[width=\columnwidth]{fig3_deflation.png}
+\caption{Greedy deflation at $n = 512$: reported $\hat d$ against the true
+symmetric difference $m$ for per-step search budgets $K = 1, 16, 256$.
+The estimate plateaus independent of $m$.}
+\label{fig:deflation}
+\end{figure}
 
-Distance is an estimator, not a commitment, and a grinding adversary can
-make a large true difference look smaller. The cheapest strategy is
-near-antipodal pairs: for a target $v = v(tx)$, find $tx'$ whose vector
-agrees with $-v$ on all but $a$ coordinates, so the pair contributes
-$4a$ to the squared distance instead of the honest expectation $2n$.
-Agreement counts are $\mathrm{Bin}(n, 1/2)$, so a pair achieving
-$a \le n/4$ (factor-two deflation) occurs with probability
-$e^{-n/8} = 2^{-92}$ at $n = 512$, and a birthday search over $M$
-candidates yields about $M^{2} 2^{-93}$ usable pairs: one pair per
-$2^{47}$ hash-and-sign candidates, each of which costs the adversary a
-signable transaction. Factor-four deflation costs $2^{104}$ candidates
-per pair. Deflation is therefore bounded to constant factors at
-exponential grinding cost, and per-height salting of the round domain
-forces any precomputed table to be rebuilt every block, converting a
-one-time investment into an online per-block cost.
-
-Salting, however, destroys cross-height algebra, which the accumulators
-need. Hence the two domains of Section~\ref{sec:primitive}: the salted
-round domain feeds thresholds, where deflation matters and no
-cross-height algebra is needed; the fixed ledger domain feeds equality
-and conservation checks, which rest on binding, not on distance, so
-deflation is irrelevant there. Each domain carries exactly the property
-it needs and no more.
-
-\subsection{Proximity Is Unbindable}
-
-\begin{theorem}[Proximity non-bindability]
-\label{thm:impossible}
-Let $D$ be any multiset hash with the distance-preservation property that
-$|A \,\triangle\, B| \le d_{0}$ implies $\norm{D(A) - D(B)}$ small (below
-any protocol threshold $\tau$) with non-negligible probability. Then
-there is no security notion under which digest proximity certifies set
-proximity against adversarially chosen inputs: for every threshold
-$\tau$, the adversary can exhibit pairs of sets within $\tau$ that differ
-in protocol-relevant ways. Consequently, in any protocol composed with
-$D$, proximity may gate scheduling, synchronization, and optimistic
-paths, but never a safety predicate.
-\end{theorem}
-
-\begin{IEEEproof}
-For small differences the claim is the property itself: replace one
-transaction by an adversarial one; distance preservation puts the
-resulting set within $\tau$ for any usable $\tau$, and the sets differ in
-exactly the transaction the adversary chose. For larger differences,
-grinding (Section~\ref{sec:deflation}) extends the reach at quantifiable
-cost, without ever needing a collision. Any protocol that commits state
-on a proximity predicate therefore commits, with adversarial help, to a
-set other than intended, violating safety by construction. The only
-predicates immune to this argument are those independent of $D$'s
-geometry, i.e., exact equality (Section~\ref{sec:binding}) and external
-authentication such as signatures.
-\end{IEEEproof}
-
-Theorem~\ref{thm:impossible} is the public-coin, multiset-hash analogue
-of the Hardt-Woodruff theorem that linear sketches are not robust to
-adaptive inputs~\cite{hardt2013robust}. The resolutions differ: rather
-than seeking a robust sketch, we route all safety through signatures on
-collision-resistant hashes and let the estimator fail soft. The
-conference version stated this honesty informally (``Phase 1 contributes
-no cryptographic security''); the theorem makes the architecture forced
-rather than stylistic.
+Two consequences follow. First, no decision whose \emph{safety} depends
+on the estimate is admissible; this is the trivial direction (sets at
+distance one already differ in a transaction a protocol may care about)
+made quantitative. Robust property-preserving
+hashes~\cite{boyle2019pph,fleischhacker2021pph,holmgren2022pph} show that
+a different object with a larger output can certify distance thresholds
+against adversaries; the AMS sketch is not that object. Second, every
+consumer of an estimate must fail soft. In our protocols an underestimate
+undersizes an IBLT, which then doubles (extra rounds); misleads the
+sensing proposer into proposing early (a lost fast path); or hides a
+partition until quorum failure reveals it (the status quo). Where an
+estimate must withstand chosen inputs, the parties should commit to their
+sets before the salt is drawn (\emph{commit, then salt}), restoring the
+hypothesis of Lemma~\ref{lem:unbiased}.
 
 %============================================================================
-\section{Estimation-Augmented Consensus}
-\label{sec:augment}
+\section{Consensus: a Base Protocol and a Safe Fast Path}
+\label{sec:consensus}
 
-\begin{definition}[Estimation augmentation]
-\label{def:augment}
-Let $\Pi$ be a BFT protocol whose commit predicate is ``at least $2N/3$
-valid signatures on $H(B)$'' for a collision-resistant $H$. An
-\emph{estimation augmentation} $\Pi{+}E$ adds messages and rules that may
-depend on DPMH digests, but whose outputs gate only scheduling (when to
-propose, when to attempt a fast path), synchronization (which
-transactions to push to whom), and reporting. The commit predicate is
-unchanged.
+\subsection{The base protocol $\Pi$}
+
+$\Pi$ is single-slot agreement in the two-phase locking style of PBFT,
+Tendermint, and HotStuff-2. In view $v$ the leader collects
+\textsc{new-view} messages from $n - f$ validators, each carrying the
+sender's lock (the highest prepare certificate it holds) and its
+prepare-vote history; it proposes the value $\mathrm{select}$ forces, or
+any value if none is forced, attaching the \textsc{new-view} set.
+Validators vote \textsc{prepare} once per view if the proposal equals
+$\mathrm{select}$ of the attached set and their lock permits it (the
+proposal matches the lock, or the forcing evidence is from a view at
+least as high). $n - f$ prepare votes form a prepare certificate, on
+which validators lock and vote \textsc{commit}; $n - f$ commit votes
+decide.
+
+\subsection{The fast path}
+
+If one view gathers $\nf = \lceil (n + 3f + 1)/2 \rceil$ prepare votes
+for a value, those votes are a decision certificate: one voting round.
+$\mathrm{select}$ must then recover fast decisions:
+
+\begin{definition}[select]
+Scan views from highest to lowest. At the first view holding a prepare
+certificate, return its value; at the first view in which some value has
+at least $\nf - 2f$ claimed prepare votes in the \textsc{new-view} set,
+return that value. If neither occurs, the leader is free.
 \end{definition}
 
-\begin{theorem}[Safety preservation]
-\label{thm:compose}
-$\Pi{+}E$ satisfies the same safety property as $\Pi$ against the same
-adversary class.
+\begin{theorem}[Safety]
+\label{thm:safety}
+If at most $f$ validators are Byzantine, no two honest validators decide
+different values.
 \end{theorem}
 
-\begin{IEEEproof}
-Estimation messages are auxiliary: digests are computable from public
-data and require no secrets. Given any adversary $\mathcal{A}$ against
-$\Pi{+}E$, construct $\mathcal{A}'$ against $\Pi$ that internally
-simulates the estimation layer, forwarding to $\Pi$ exactly the commit
-messages $\mathcal{A}$ produces. The executions agree on all commit
-messages, so any safety violation in $\Pi{+}E$ is one in $\Pi$. $\Pi$'s
-safety argument, quorum intersection on signed $H(B)$, never invokes any
-property of $D$.
+\begin{IEEEproof}[Proof sketch]
+Suppose $x$ is decided first in view $w$. If by fast certificate, at
+least $\nf - f$ honest validators voted $x$ in $w$; any $n - f$
+\textsc{new-view} set omits at most $f$ of them, so $x$ has at least
+$\nf - 2f$ claims for view $w$, while any $y \ne x$ has at most $f$
+(Byzantine claims) plus $n - \nf$ (honest votes cast elsewhere), which is
+below $\nf - 2f$ because $2\nf > n + 3f$. If by commit certificate, at
+least $n - 2f \ge f + 1$ honest validators lock on a prepare certificate
+for $x$ from view $w$, and every $n - f$ set contains one. A prepare
+certificate and a fast certificate in the same view share at least
+$\nf - f > f$ honest voters, so they name the same value. By induction
+over later views, honest validators vote only for $x$: any valid
+\textsc{new-view} set forces $x$ at view $w$, holds no certificate for
+another value in a later view, and holds at most $f < \nf - 2f$ claims
+for one. Hence every later certificate, fast or slow, is for $x$.
 \end{IEEEproof}
 
-\begin{corollary}[Speculative fast path]
-\label{cor:fastpath}
-In Phase~1 each validator sends $(D_{i}, \sigma_{i})$ with $\sigma_{i}$ a
-BLS signature on $(h, H(B_{\mathrm{prop}}))$, attached iff its local
-state matches the proposal. If the aggregator collects $2N/3$ matching
-signatures in round one, it aggregates them and multicasts a finality
-certificate identical to the object the signature phase produces
-(96-byte aggregate plus $N/8$-byte signer bitmap). The fast path is a
-scheduling event under Definition~\ref{def:augment}, covered by
-Theorem~\ref{thm:compose}; an aggregator cannot fabricate a certificate
-and can at most withhold one, a liveness effect.
-\end{corollary}
+Two details matter, and our fuzzer found both. The first is the quorum:
+with $\nf = n - f = 2f + 1$, the rule of our earlier version, the
+counting step fails. A minimal counterexample: with $n = 4$,
+$f = 1$, a Byzantine leader equivocates, the Byzantine validator and two
+honest validators vote $y$, one honest validator sees the three votes
+and decides $y$; in the next view the leader's \textsc{new-view} set
+holds the Byzantine (now claiming $x$), the honest $x$-voter, and one
+$y$-voter, so $x$ is forced and the slow path decides $x$. The second is
+the history: our first implementation of the corrected rule sent only
+each validator's latest vote. At $n = 6$, $f = 1$ the fuzzer found an
+execution in which honest validators kept voting $x$ in later
+low-turnout views, each below threshold, overwriting the view-$w$
+evidence until a leader was free to propose $y$. Reporting the vote
+history (in a deployment, the votes cast since the validator's lock), as
+FaB and SBFT do, closes it. Table~\ref{tab:fuzz} summarizes the fuzzing:
+10,000 executions per configuration with equivocating leaders,
+double-voting validators that lie in \textsc{new-view}, random partial
+delivery for four asynchronous views, then synchronous views until an
+honest leader decides.
 
-The corollary repairs two defects of the conference version at once. Its
-fast-path certificate was issued from digest agreement alone, backed by
-no signatures, which Theorem~\ref{thm:impossible} now rules out on
-principle. And its trigger tested a global statistic, near-zero cluster
-variance, which a single Byzantine validator inside the threshold could
-perturb forever, disabling the fast path for free. Counting signatures is
-\emph{honest-sufficient}: below the corruption bound the honest $2N/3$
-match regardless of what the adversary submits. We state the design rule
-explicitly because it generalizes: \emph{optimistic triggers must fire on
-honest-sufficient conditions, never on global statistics the adversary
-can perturb.}
+\begin{table}[t]
+\caption{Adversarial fuzzing of the base protocol with the fast path
+(10,000 executions per row, $f$ Byzantine).}
+\label{tab:fuzz}
+\centering
+\footnotesize
+\begin{tabular}{@{}rrrlrr@{}}
+\toprule
+$n$ & $f$ & \nf & rule & conflicting & not live\\
+\midrule
+4 & 1 & 4 & $\lceil (n+3f+1)/2 \rceil$ & 0 & 0\\
+6 & 1 & 5 & $\lceil (n+3f+1)/2 \rceil$ & 0 & 0\\
+7 & 2 & 7 & $\lceil (n+3f+1)/2 \rceil$ & 0 & 0\\
+9 & 2 & 8 & $\lceil (n+3f+1)/2 \rceil$ & 0 & 0\\
+10 & 3 & 10 & $\lceil (n+3f+1)/2 \rceil$ & 0 & 0\\
+\midrule
+4 & 1 & 3 & $n - f$ (earlier version) & 363 & 0\\
+7 & 2 & 5 & $n - f$ (earlier version) & 434 & 0\\
+10 & 3 & 7 & $n - f$ (earlier version) & 425 & 0\\
+\bottomrule
+\end{tabular}
+\end{table}
 
-\textbf{Robust reference.} The clustering reference in the conference
-version was the aggregator's own state, a single manipulation point: a
-Byzantine aggregator could place the reference anywhere and exclude every
-honest validator. The reference is now the coordinate-wise median of the
-submitted, signed Phase~1 digests, computable and verifiable by any
-validator, with breakdown point $1/2$ per coordinate imported from robust
-distributed learning~\cite{blanchard2017krum,yin2018robust}. A coalition
-below one half cannot move any coordinate of the reference outside the
-range of honest values, and the aggregator retains no discretion.
+\textbf{The price.} At $n = 3f + 1$ the safe fast quorum is $n$: a single
+abstaining validator disables the fast path, as for every one-round
+protocol at optimal resilience~\cite{kuznetsov2021fast}. The fast path
+pays when deployments configure $f$ below $n/3$; with $n = 100$ and
+$f = 20$, $\nf = 81$, so up to 19 validators may be slow or abstain.
 
-\textbf{Readiness sensing.} Because digests ride on gossip, the proposer
-can watch the digest cloud converge and propose when the number of
-exactly-matching validators reaches the quorum, rather than proposing on
-a timer and hoping. Sensing turns the fast-path probability from the
-weather term $(1 - p_{\mathrm{miss}})^{N}$ into a controlled quantity
-bounded by gossip delay, at zero added messages (the observations ride
-traffic that flows anyway); the cost is measured waiting time, which we
-quantify in Section~\ref{sec:eval}.
+\textbf{Where the sketch enters.} Prepare votes may carry the voter's
+sketch of the proposal; the reference is $D(B)$, which anyone computes
+from the block, so no party has discretion over it. The sketches report
+who was behind and by how much; they never gate a vote or a certificate.
+The fast-path trigger is a signature count, so a Byzantine validator that
+signs correctly but submits a misleading sketch cannot suppress it.
+The variance trigger of our earlier version could be suppressed by one
+such validator (Fig.~\ref{fig:fastpath}, left).
 
-\begin{theorem}[Liveness]
-\label{thm:liveness}
-Suppose $f < N/3$, each honest validator independently has an incomplete
-view with probability $p_{\mathrm{miss}}$ missing at most $k_{\max} = 2$
-transactions, and let $\delta_{\mathrm{sync}}$ bound the probability that
-a flagged straggler fails to synchronize before the signature-phase
-timeout. Then the per-honest-validator probability of failing to
-contribute a signature is $p \le p_{\mathrm{miss}} e^{-n/8} +
-\delta_{\mathrm{sync}}$, and consensus fails to finalize with probability
-at most $\exp\!\bigl(-2N(1/3 - p)^{2}\bigr)$.
-\end{theorem}
+\begin{proposition}[Liveness after GST]
+\label{prop:liveness}
+After GST, a view with an honest leader decides through the slow path:
+the $n - f$ honest validators obtain missing transactions by id within
+the view timeout and vote. The fast path fires iff at least \nf\ valid
+prepare votes arrive before the fast timeout; with $b$ correctly signing
+Byzantine validators and each of $h$ honest validators independently
+holding the full block with probability $1 - p_{\mathrm{miss}}$, this is
+$\Pr[\mathrm{Bin}(h, 1 - p_{\mathrm{miss}}) \ge \nf - b]$.
+\end{proposition}
 
-\begin{IEEEproof}
-An honest validator misses a signature only if falsely excluded
-(probability at most $e^{-n/8}$ conditioned on an incomplete view, by the
-threshold analysis of Section~\ref{sec:threshold}) or unsynchronized.
-Exclusions are independent across validators; Hoeffding over the $N$
-honest indicators against the $N/3$ failure boundary gives the bound.
-\end{IEEEproof}
+The liveness theorem of our earlier version bounded the failure
+probability by $\exp(-2N(1/3 - p)^{2})$, which ignores the $f$ Byzantine
+abstainers: at $f = \lfloor (N-1)/3 \rfloor$ the honest validators
+\emph{are} the quorum, and with $p = 0.01$ at $N = 1000$ the probability
+that at least one of them is missing at a fixed deadline exceeds $0.99$,
+not $10^{-91}$. Correct statements count the slack $n - f - q$ explicitly,
+as above, and rely on synchronization rather than on luck.
 
-At $n = 512$ the false-exclusion term is $p_{\mathrm{miss}} e^{-64}$,
-negligible against $\delta_{\mathrm{sync}}$; liveness is governed by the
-synchronization path, as it should be. The conference version's
-false-exclusion term was an empirical $5 \times 10^{-3}$; the analytic
-replacement is twenty-six orders of magnitude smaller, and exclusion is
-now a scheduling event rather than a participation event, since a synced
-straggler rejoins the signature phase.
+\textbf{Tree mode.} Validators form leaves of ten; the first member of
+each leaf is its leader, and validators are placed at random, so some
+leaf leaders are Byzantine. Votes aggregate up the tree; a leaf whose
+leader is silent times out and its members send directly to the root, as
+in Kauri. Leaf summaries of sketches are exact integers.
 
 %============================================================================
-\section{The Proxima Protocol}
-\label{sec:protocol}
+\section{Observability}
+\label{sec:observe}
 
-\textbf{Flat protocol.} The proposer disseminates the block; validators
-receive it with delay $p_{\mathrm{miss}}$. In Phase~1 each validator
-sends its round digest (1024\,B) and, if its state matches, the
-conditional commitment $\sigma_{i}$ (96\,B). The aggregator forms the
-median reference, clusters by the integer comparison
-$\norm{\dd}^{2} \le 3n$, and synchronizes stragglers by
-estimate-then-decode: the digest distance sizes an IBLT whose peeling
-returns exactly the missing transactions, which the aggregator then
-pushes. With $2N/3$ commitments in hand the fast path finalizes in one
-round trip (Corollary~\ref{cor:fastpath}); otherwise cluster members send
-signed commitments and the aggregator multicasts the aggregate plus
-bitmap. Every decision on the consensus path is an integer comparison.
+\textbf{Readiness sensing.} Each gossip interval, validators send the
+proposer the sketch of their view of the candidate block (1\,KB each,
+charged in full). The proposer proposes when at least \nf\ sketches equal
+$D(B)$ exactly, or at a cap. Byzantine validators can report $D(B)$
+without holding the block; the effect is an early proposal and a lost
+fast path, never a safety issue. The comparison that matters is against
+a fixed delay of the same mean, not against proposing immediately.
 
-\textbf{Tree protocol.} Validators form leaves of ten; leaf leaders
-filter by distance, synchronize stragglers, and forward the exact summary
-(digest sum, weight, squared-distance sum, 1036\,B); internal nodes add
-summaries, which is exact by linearity, and the root checks the global
-mean. The signature phase aggregates BLS commitments up the tree. Leaves
-never vote, so no leaf can fail in the BFT sense: a leaf of five honest
-and five Byzantine validators reports the filtered mean of the honest
-five. Carrying speculative commitments up the tree requires per-group
-signer bitmaps and remains future work.
+\textbf{Synchronization.} Inside consensus a validator knows the ids it
+lacks and fetches them; no sketch is needed (Fig.~\ref{fig:sync}, left).
+Sketch-sized IBLTs~\cite{goodrich2011iblt} matter where no id list exists:
+mempool reconciliation between peers, partition healing, and fork
+healing. IBLT short ids are salted per session, as in Erlay, so an
+adversary cannot grind colliding ids in advance; the decoder knows only
+its own items and fetches the rest in one further round.
 
-\textbf{Two-syndrome synchronization.} The digest is the syndrome of a
-random linear code over $\mathbb{Z}_{q}$: hard to decode, which is
-exactly the binding of Section~\ref{sec:binding}, but with error weight
-estimable from the syndrome norm (Lemma~\ref{lem:unbiased}). IBLTs are
-the complementary syndrome: efficiently decodable, recovering the exact
-difference at communication proportional to it, but neither binding nor
-distance-revealing. The protocol always pairs them: estimate with the
-hard code, decode with the easy one, at IBLT size $1.5(\hat{d} + 6)$
-cells of 16 bytes, doubling on the rare decode failure. This replaces the
-conference version's Bloom filters everywhere and deletes their
-false-positive liveness channel outright, since IBLT peeling has no false
-positives.
+\textbf{Partition detection and healing.} A partition makes the sketch
+cloud bimodal. Camp centroids are exact by linearity, the inter-camp
+$\hat d = \norm{\mu_{1} - \mu_{2}}^{2}/n$ sizes the repair before it
+starts, and one estimate-then-decode exchange between representatives
+gives both camps the union.
 
-\textbf{Fork localization and partition healing.} Cumulative ledger
-accumulators make any range digest a subtraction, so two nodes locate
-their fork point by binary search on prefix equality: $\log_{2} H + 1$
-probes of one accumulator each, with every probe also yielding
-$\hat{d}$ for the probed range, after which one reconciliation exchange
-heals the divergent suffix. During a partition the Phase~1 cloud turns
-bimodal; cluster centroids are exact by linearity, the inter-camp
-$\hat{d} = \norm{\mu_{1} - \mu_{2}}^{2}/n$ measures the disagreement
-before any repair traffic flows, and one estimate-then-decode exchange
-between camp representatives restores the union at cost proportional to
-the true divergence. Hash-based protocols observe only quorum failure in
-both situations. The same subtraction gives verifiable prune accounting:
-a node claiming to have pruned set $P$ proves $D(\text{before}) -
-D(\text{after}) = D(P)$, and binding makes the claim sound.
+\textbf{Fork localization.} Prefix accumulators $P[b] = \sum_{b' \le b}
+D(\mathrm{block}_{b'})$ make every range digest a subtraction. Two nodes
+find their fork point by binary search on LtHash equality of prefixes in
+$\lceil \log_{2} H \rceil + 1$ probes, and each probe's sketch reports how
+much diverged. The structure is that of range-based set
+reconciliation~\cite{meyer2023rbsr}; the size estimate per probe is the
+addition.
+
+\textbf{Gossip-averaged agreement.} Because sketches are linear, push-sum
+gossip~\cite{kempe2003gossip} lets every validator estimate the mean
+sketch $\mu$ and the dispersion $\frac{1}{N}\sum_{j}\norm{D_{j} -
+\mu}^{2}/n$ without an aggregator. The dispersion plays the role of
+$1 - r^{2}$ for the Kuramoto order parameter $r$ of coupled oscillators,
+which inspired this project's name; we claim the analogy as a metric
+only, and a Byzantine-robust gossip variant is future work.
 
 %============================================================================
 \section{Cross-Shard Conservation}
 \label{sec:conservation}
 
-Sharded execution multiplies state comparison into many pairs, and
-hash-based tools force per-transaction coordination: two-phase commit
-spends four cross-shard messages per transaction plus intra-shard
-consensus on each, and receipt systems~\cite{nightshade} carry metadata
-proportional to volume. We instead make settlement a conservation law.
-Every cross-shard transaction $t$ from shard $i$ to shard $j$ adds
-$v(t)$ (ledger domain) to $i$'s outbound corridor accumulator
-$O_{i \to j}$ when the debit applies and to $j$'s inbound accumulator
-$I_{i \to j}$ when the credit applies; each shard's quorum signs its
-aggregated outbound and inbound accumulators every block, and the beacon
-checks
+Each cross-shard transaction $t$ from shard $i$ to shard $j$, debited at
+block $h$, adds the ledger digest of the corridor-keyed item
+$(i, j, t)$ to $i$'s outbound accumulator $O_{ij}[h]$; when $j$ applies
+the credit, whose message carries $h$, the same item enters $j$'s inbound
+accumulator $I_{ij}[h]$. Each block, every shard's quorum signs its
+aggregate outbound and inbound digests over \emph{settled} cohorts
+($h \le \mathrm{now} - W$), and the beacon checks
 \begin{equation}
-\textstyle\sum_{i} O_{i} \;=\; \sum_{j} I_{j}
+\textstyle\sum_{i} O_{i}^{\le \mathrm{now} - W} \;=\;
+\sum_{j} I_{j}^{\le \mathrm{now} - W}.
 \end{equation}
-over a settlement window $W$: double-entry bookkeeping in vector space,
-at $O(S)$ kilobyte-scale signed objects per block regardless of volume.
 
-\begin{theorem}[Conservation soundness]
+\textbf{Threat model.} Each shard's quorum attests honestly to what the
+shard applied; shard-internal execution is secured by its own BFT
+instance. The faults detected are in the cross-shard path: dropped,
+replayed, minted, and misrouted credits from faulty or Byzantine
+relayers and bridges. A Byzantine shard quorum could sign accumulators
+that misreport its own execution; catching that needs state-validity or
+fraud proofs and is out of scope.
+
+\begin{theorem}[Conservation]
 \label{thm:conservation}
-If the invariant holds over quorum-signed accumulators and the
-accumulator is collision-binding, then the multiset of applied debits
-equals the multiset of applied credits except with negligible
-probability; any minted, lost, or replayed cross-shard effect requires
-forging a quorum signature or finding a digest collision.
+Under this threat model, if the settled invariant holds then the multiset
+of settled debits equals the multiset of settled credits, per corridor,
+unless an LtHash collision has been found.
 \end{theorem}
 
 \begin{IEEEproof}
-The invariant asserts $D(\text{debits}) = D(\text{credits})$ in the
-ledger domain. If the underlying multisets differ, the pair is a
-collision (Section~\ref{sec:binding}); if a shard signs an accumulator
-inconsistent with its applied transactions, safety of its intra-shard
-quorum is violated. Value conservation follows from multiset conservation
-plus intra-shard execution validity, since amounts are bound inside the
-hashed transactions; we deliberately do not weight vectors by amounts,
-which would weaken the SIS instance.
+Both sides are LtHash sums over corridor-keyed items. If the multisets
+differ, the two sums are a collision for distinct multisets of
+LtHash inputs.
 \end{IEEEproof}
 
-\begin{proposition}[Localization by group testing]
-\label{prop:localize}
-On invariant failure, the beacon bisects the corridor set with digests
-aggregated over halves, recursing into imbalanced halves. Bisection over
-a linear measurement is exact, and $f$ faulty corridors among $C$ are
-localized in at most $2f(\log_{2}(C/f) + 2)$ probes, each one signed
-kilobyte-scale object.
-\end{proposition}
+Three design choices carry the result, and each repairs a failure of our
+earlier drafts. \emph{Corridor keying}: without it, a credit applied on
+the wrong corridor adds the same vector the debit added and the global
+invariant still balances; with it, a misroute is a drop on one corridor
+and a mint on another. \emph{Cohort indexing}: credits trail debits by
+network latency, so comparing whole accumulators raises alarms on every
+busy corridor; comparing only settled cohorts raises none. \emph{Group
+testing}: on violation the beacon bisects the corridor set with
+aggregated settled digests; corridor keying makes cancellation inside a
+group require a collision, so the recursion is exact and uses at most
+$2f\lceil \log_{2}(C/f) \rceil + 1$ probes for $f$ faulty corridors
+among $C$. A multiset-aware IBLT over the settled debits and credits of
+an alarmed corridor then names its dangling transactions; a replayed
+credit decodes as one extra.
 
-Two refinements make the mechanism operational. First, the per-corridor
-\emph{pending digest} $P_{ij} = O_{i \to j} - I_{i \to j}$ is not merely
-an alarm signal: it is the ledger digest of the in-flight transaction set
-on that corridor, so its norm meters in-flight volume continuously, and
-the invariant is enforced as ``$P_{ij}$ decays to zero within $W$
-blocks,'' with aging alarms separating ordinary settlement lag from
-faults, since credits necessarily trail debits by network latency.
-Second, each corridor can carry the IBLT syndrome of the same in-flight
-set alongside $P_{ij}$ (both objects are linear), so an alarmed corridor
-decodes exactly its dangling transactions, dropped credits and minted
-credits alike, from the source's applied-debit set against the
-destination's applied-credit set, with no further exchange.
-
-The semantics deserve a plain statement: this is detection and settlement
-verification, not locking. Digests order nothing; the protocol pairs the
-invariant with optimistic execution and a $W$-block revert window, or
-credits at the destination only on digest match, which is
-receipt-equivalent in latency but constant-size in verification metadata.
-The contribution is the verification and fraud-localization cost, and the
-fair baseline comparison is per-block verification metadata against
-batched two-phase commit and batched receipts, which we report in
-Section~\ref{sec:eval}. A beacon may additionally maintain the single
-running digest $G \mathrel{+}= \sum_{i} \Delta_{i}$ per block, one 2\,KB
-object summarizing the entire system's applied history, updatable by
-addition and prunable by subtraction with verifiable prune accounting,
-none of which a Merkle root supports.
+The semantics are detection and settlement verification, not atomicity:
+pair the invariant with optimistic execution and a revert window, or
+credit only on match.
 
 %============================================================================
 \section{Evaluation}
 \label{sec:eval}
 
-All experiments run in the discrete-event simulator of the public
-artifact, which counts every message with identical byte constants across
-protocols; BLS operations use mocks preserving wire sizes, cross-validated
-against real BLS12-381 on small runs. The suite of 41 correctness checks,
-including the exact test vectors of Section~\ref{sec:primitive}, passes
-on every run reported here. Baselines are HotStuff~\cite{yin2019hotstuff},
-HotStuff-2~\cite{malkhi2023hotstuff2}, PBFT~\cite{castro1999pbft}, and a
-message-count model of Kauri~\cite{kauri} (fanout 10) that credits its
-tree dissemination but not its pipelining and does not charge its
-reconfiguration on relay failure, a deliberately generous simplification
-we return to below. Unless stated, $N$ splits 70/30 honest/Byzantine,
-$p_{\mathrm{miss}} = 0.37$ with $k_{\max} = 2$, and blocks carry 21
-transactions.
+\textbf{Method.} The artifact accounts every message under one cost
+model shared by all protocols: the proposal (64\,B plus 32\,B per
+transaction id) reaches all $N$ validators, votes are 128\,B, a
+certificate is a 96\,B aggregate plus 64\,B of metadata and an $N/8$-byte
+signer bitmap (or no bitmap with threshold signatures), stragglers fetch
+by id at 232\,B per transaction, Byzantine validators abstain, every
+certificate reaches every validator, and we track bytes arriving at the
+leader. Signatures are verified: a hash-based verifiable mock at scale,
+real BLS12-381 in the tests. This is a counting simulator, not a network
+emulator; it reports no latency. Unless stated, 30\% of validators are
+Byzantine at random positions, $p_{\mathrm{miss}} = 0.37$, and blocks
+carry 21 transactions. Baselines are HotStuff, HotStuff-2, chained
+HotStuff amortized per block, a message model of Kauri (fanout 10,
+without pipelining or reconfiguration), and PBFT.
 
-\subsection{The Estimator Behaves as Proved}
+\subsection{The estimator and the threshold}
 
-Fig.~\ref{fig:estimator} shows $\norm{\dd}^{2}/n$ against ground truth
-for missing and substituted transactions: samples collapse onto the
-analytic line $\hat{d} = d$, the $d = 1$ case is exactly $n$ with zero
-observed variance across 400 trials, and substitutions read their full
-symmetric difference, closing the conference version's blind spot.
-Fig.~\ref{fig:threshold} plots the exact small-$d$ laws against
-$\tau^{2} = 3n$: $d \le 2$ sits cleanly below threshold ($0$ exclusions
-in 500 validation trials, against the $e^{-64}$ bound), $d = 4$ cleanly
-above, and $d = 3$ straddles it, resolved by synchronization as designed.
+Fig.~\ref{fig:estimator} shows the estimate for missing and substituted
+transactions against the analytic mean; at $d = 1$ the estimate is
+exactly 1 in all 400 trials. Fig.~\ref{fig:threshold} plots the exact
+distributions behind the tail probabilities of
+Section~\ref{sec:primitive}.
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{fig1_estimator.png}
-\caption{Squared digest distance over $n$ against true symmetric
-difference, for missing (blue) and substituted (orange) transactions,
-400 trials per case at $n = 512$. Boxes collapse onto the analytic line;
-$d = 1$ has zero variance.}
+\caption{$\norm{\dd}^{2}/n$ for missing (blue) and substituted (orange)
+transactions, 400 trials per case, $n = 512$, against
+$\mathbb{E}\hat d = d$.}
 \label{fig:estimator}
 \end{figure}
 
 \begin{figure}[t]
 \centering
 \includegraphics[width=\columnwidth]{fig2_threshold.png}
-\caption{Distributions of $\norm{\dd}^{2}/n$ at $d = 1, \dots, 4$ against
-the closed-form threshold $\tau^{2} = 3n$ (log scale). $d = 1$ is a point
-mass at exactly $1$; honest stragglers ($d \le 2$) never cross the
-threshold; $d = 3$ is the designed ambiguity region.}
+\caption{Exact distributions of $\norm{\dd}^{2}/n$ for $d = 1, \dots, 4$
+at $n = 512$ (log scale) against $\tau^{2} = 3n$.}
 \label{fig:threshold}
 \end{figure}
 
-\subsection{Reference Robustness}
+\subsection{Fast path}
 
-Fig.~\ref{fig:reference} mounts a coordinated drag attack: all Byzantine
-validators submit one extreme digest and the aggregator is itself
-Byzantine. With the conference version's aggregator-chosen reference the
-adversary excludes 100\% of honest validators at every corruption level,
-a total liveness failure available to a single corrupted role. The
-coordinate-wise median reference excludes no honest validator up to the
-45\% corruption we tested, matching its breakdown guarantee.
-
-\begin{figure}[t]
-\centering
-\includegraphics[width=\columnwidth]{fig3_reference.png}
-\caption{Honest exclusion under coordinated drag with a Byzantine
-aggregator, $N = 90$, eight trials per point. The aggregator-chosen
-reference (v1) admits total exclusion; the coordinate-wise median (v2)
-admits none through 45\% corruption.}
-\label{fig:reference}
-\end{figure}
-
-\subsection{Fast Path: Griefing and Sensing}
-
-Fig.~\ref{fig:fastpath} (left) is the griefing experiment: mimicking
-Byzantine validators sit inside the cluster and perturb its variance. The
-variance trigger of the conference version drops from 100\% to 0\%
-fast-path engagement at a single such adversary and never recovers; the
-commitment-counting trigger is indifferent through eight, as
-honest-sufficiency predicts. Fig.~\ref{fig:fastpath} (right) evaluates
-readiness sensing at increasing initial miss rates with a gossip fill
-probability of $0.5$ per tick and an 8-tick cap: fixed-interval proposal
-collapses to a 6\% fast-path rate at $p_{\mathrm{miss}} = 0.2$ and to
-zero beyond $0.4$, while the sensing proposer waits a measured mean of
-$1.3$ to $3.4$ ticks and engages the fast path in every trial through
-$p_{\mathrm{miss}} = 0.8$. Sensing spends bounded, observable delay to
-buy a round; the exchange rate is the gossip fill time, not a protocol
-constant.
+Fig.~\ref{fig:fastpath} (left) uses $N = 100$, $f = 20$, $\nf = 81$, and
+complete views. Byzantine validators that sign correctly but submit
+misleading sketches disable the variance trigger of our earlier version
+at the first such validator and leave the signature trigger at 100\%
+through 20 of them. Abstaining Byzantine validators leave it at 100\%
+through 19 and disable it at 20, where fewer than \nf\ signers remain;
+no trigger can do better. Fig.~\ref{fig:fastpath} (right) compares
+sensing with a fixed delay equal to the mean sensed delay (40 trials per
+point, gossip fill probability 0.5 per tick, cap 8). Sensing engaged the
+fast path in every trial at mean delays of 0 to 3.05 ticks; the fixed
+delay reached 55\% to 100\%, losing most where the mean delay rounds to
+zero ticks (55\% at $p_{\mathrm{miss}} = 0.2$). The gain comes from
+adapting the delay per block. Its cost is 100\,KB of sketch gossip per
+tick at $N = 100$.
 
 \begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{fig4_fastpath.png}
-\caption{Left: fast-path rate against in-cluster mimicking Byzantine
-validators ($N = 60$ honest, complete views); the variance trigger dies
-at one adversary, the commitment trigger is unaffected. Right: fast-path
-rate against initial $p_{\mathrm{miss}}$ for fixed-interval versus sensed
-proposal (fill probability $0.5$ per tick, cap 8 ticks, mean measured
-delay $0$ to $3.4$ ticks).}
+\caption{Left: fast-path rate against the number of Byzantine validators
+($N = 100$, $f = 20$, $\nf = 81$, dotted line at $N - \nf$): signing
+with misleading sketches versus abstaining. Right: fast-path rate
+against initial $p_{\mathrm{miss}}$, sensed proposal versus a fixed
+delay of the same mean.}
 \label{fig:fastpath}
 \end{figure*}
 
-\subsection{Synchronization Cost}
+\subsection{Synchronization}
 
-Fig.~\ref{fig:sync} compares straggler synchronization sketches at local
-set size 500. The Bloom filter of the conference version costs a flat
-599 bytes because it encodes the whole set, and carries a false-positive
-channel besides; the IBLT costs 256 bytes up to $d = 4$ and grows
-linearly in the true difference with exact decode (every trial decoded in
-one round at the estimator-supplied size). Below $d \approx 16$ the exact
-sketch is also the cheaper one; beyond, it pays only for what actually
-differs.
+Fig.~\ref{fig:sync} (left) is the block-level case: fetching $k$ missing
+transactions by id costs $232k$ bytes, an IBLT sized for $k$ plus the
+push costs more, and a 1\% Bloom filter over the 21-transaction block
+plus the push costs slightly less but admits false positives. No sketch
+is needed. The right panel is mempool reconciliation between two peers
+holding 5000 transactions. A sketch-sized IBLT decoded at its first size
+at every difference tested, so it costs the 1\,KB sketch plus about what
+an IBLT sized by an oracle costs; starting from the minimum size and
+doubling is cheaper for $d \le 8$ and costs $2.5\times$ more bytes and
+8 rounds at $d = 512$. A Bloom filter of the whole set (5990\,B)
+is cheaper than any IBLT beyond a few hundred differences, at the price
+of false positives. When a sketch is already on the wire it removes the
+doubling; self-sizing and rateless IBLTs~\cite{wu2026ibltmeasure,
+yang2024rateless,keniagin2025certainsync} remove it otherwise.
 
-\begin{figure}[t]
+\begin{figure*}[t]
 \centering
-\includegraphics[width=\columnwidth]{fig5_sync.png}
-\caption{Sync sketch bytes against true difference at set size 500. The
-Bloom filter scales with the set and admits false positives; the IBLT
-scales with the difference and decodes exactly.}
+\includegraphics[width=\textwidth]{fig5_sync.png}
+\caption{Left: block-level synchronization of $k$ missing transactions.
+Right: mempool reconciliation bytes (excluding the transfer of the
+missing bodies) against the true difference, 5000 transactions.}
 \label{fig:sync}
-\end{figure}
+\end{figure*}
 
 \subsection{Conservation}
 
-Fig.~\ref{fig:conservation} (left) plots per-block verification metadata
-at $S = 16$ shards: batched receipts and batched two-phase commit grow
-with volume, conservation is flat at 67\,KB, and the crossover sits at
-roughly 2{,}100 cross-shard transactions per block, below which receipts
-are cheaper and above which conservation wins unboundedly.
-Fig.~\ref{fig:conservation} (right) confirms
-Proposition~\ref{prop:localize}: measured localization probes at $C = 64$
-corridors track $2f(\log_{2}(C/f) + 2)$ and localization was exact in
-every run. The end-to-end fault run of Section~\ref{sec:conservation}
-(16 shards, 14{,}400 transactions, 9 injected faults across two
-corridors, one of them a minted credit) detected the violation with a
-dangling-effect estimate of $8.9$ against the true 9, named exactly the
-two faulty corridors both by aging alarms and by 15 bisection probes, and
-the corridor syndrome decode recovered every dropped and minted
-transaction exactly.
+In a 16-shard ring run with 5120 cross-shard transactions, credits
+landing one block after debits (640 still in flight at the check), and
+six injected faults (two drops, a replay, a mint, and a misroute), the
+settled invariant failed with a dangling estimate of 5.9 against 6; the
+aged alarms named exactly the five affected corridors (the misroute
+implicates two), bisection found them in 21 probes, and the decode
+recovered every dangling transaction exactly. The same run without
+faults raised no alarm. Fig.~\ref{fig:conservation} (right) shows
+localization probes at $C = 64$ against the bound; at $f = 16$
+bisection used 71 probes, more than testing all 64 corridors, which is
+the expected regime change for group testing. Fig.~\ref{fig:conservation}
+(left) compares verification metadata. Conservation costs two signed
+4\,KB ledger digests per shard per block, independent of volume and of
+the corridor graph. Per-corridor batch roots cost 256\,B per corridor:
+on a ring they are 32 times cheaper at every size; on a full mesh,
+conservation is cheaper from $S = 34$ shards on. Batched receipts grow
+with volume on top of the per-corridor roots.
 
 \begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{fig6_conservation.png}
-\caption{Left: per-block verification metadata at $S = 16$; conservation
-is volume-independent, with the receipts crossover near 2{,}100
-cross-shard transactions per block. Right: localization probes against
-faulty-corridor count at $C = 64$, with the analytic budget.}
+\caption{Left: verification KB per block against shard count for
+conservation and for per-corridor batch roots on ring and full-mesh
+corridor graphs. Right: bisection probes against faulty corridors at
+$C = 64$, with the bound and the cost of individual testing.}
 \label{fig:conservation}
 \end{figure*}
 
-\subsection{Scaling Against Modern Baselines}
+\subsection{Cost against the baselines}
 
-Fig.~\ref{fig:scaling} and Table~\ref{tab:scaling} give message and
-bandwidth scaling to $N = 3000$ with 30\% Byzantine and 37\% partial
-observation. On messages, Proxima Tree runs $1.99\times$ below HotStuff
-and $1.69\times$ below HotStuff-2 at $N = 3000$, with the Kauri model
-above flat HotStuff since tree dissemination adds edges without removing
-voting; the conference version's headline held only against three-phase
-HotStuff, and this is the corrected claim. On bandwidth the picture
-inverts and is worth stating carefully: kilobyte digests make Proxima
-$1.4$ to $1.6\times$ heavier than HotStuff-2 at $N \le 300$, the gap
-closes through $N = 1000$, and beyond $N \approx 2000$ Proxima is
-lighter, because certificate bitmaps broadcast to all validators cost
-the hash-based protocols $\Theta(N^{2}/8)$ bytes while digests cost
-$\Theta(N)$. Deployments below the crossover can take the light profile
-(256-byte digests at 12.5\% estimator error, Table~\ref{tab:params});
-we report the default profile throughout.
+Table~\ref{tab:scaling} and Fig.~\ref{fig:scaling} report per-block
+cost. Messages: the augmented flat protocol matches HotStuff-2 (4661
+against 4659 at $N = 1000$) because its slow path is HotStuff-2's two
+phases; it is below three-phase HotStuff and Kauri, and chained HotStuff
+is cheapest at 1959. Bytes: sketches on prepare votes cost about 700\,KB
+per block at $N = 1000$ (2239\,KB with sketches, 1539\,KB without, bitmap
+certificates), putting the augmented protocol 46\% above HotStuff-2.
+Threshold certificates remove the $N/8$ bitmaps from every protocol and
+leave the ordering unchanged. Leader ingress: every prepare vote carries
+1\,KB of sketch, so the flat leader receives 875\,KB per block at
+$N = 1000$ against 175\,KB for HotStuff-2; the tree mode moves that load
+to leaf leaders (341\,KB at the root, including fallback traffic from
+Byzantine leaf leaders). The lighter $n = 128$ profile cuts sketch bytes
+by four at $12.5\%$ estimator error.
 
 \begin{table}[t]
-\caption{Messages and KB per block (30\% Byzantine,
-$p_{\mathrm{miss}} = 0.37$).}
+\caption{Per-block cost at $N = 1000$ (30\% Byzantine abstaining,
+$p_{\mathrm{miss}} = 0.37$). KB with bitmap and threshold certificates;
+leader ingress with bitmaps.}
 \label{tab:scaling}
 \centering
 \footnotesize
 \begin{tabular}{@{}lrrrr@{}}
 \toprule
- & \multicolumn{2}{c}{$N = 1000$} & \multicolumn{2}{c}{$N = 3000$}\\
-\cmidrule(lr){2-3}\cmidrule(lr){4-5}
-protocol & msgs & KB & msgs & KB\\
+protocol & msgs & KB (bitmap) & KB (thresh.) & leader KB\\
 \midrule
-Proxima Tree & 3{,}286 & 1{,}506 & 9{,}818 & 5{,}103\\
-Proxima Flat & 3{,}644 & 1{,}415 & 10{,}884 & 4{,}742\\
-HotStuff & 6{,}518 & 1{,}322 & 19{,}554 & 6{,}164\\
-HotStuff-2 & 5{,}518 & 1{,}195 & 16{,}554 & 5{,}782\\
-Kauri (msg model) & 7{,}511 & 1{,}105 & 22{,}547 & 4{,}297\\
-PBFT & 1{,}999{,}000 & 249{,}875 & 17{,}997{,}000 & 2{,}249{,}625\\
+Proxima flat & 4{,}661 & 2{,}239 & 1{,}995 & 875\\
+Proxima flat, no sketches & 4{,}661 & 1{,}539 & n/r & 175\\
+Proxima tree & 5{,}742 & 2{,}931 & 2{,}687 & 341\\
+HotStuff & 6{,}359 & 1{,}901 & 1{,}535 & 263\\
+HotStuff-2 & 4{,}659 & 1{,}535 & 1{,}291 & 175\\
+Chained HotStuff (amortized) & 1{,}959 & 1{,}169 & 1{,}047 & 88\\
+Kauri (message model) & 7{,}252 & 2{,}041 & 1{,}635 & 7\\
+PBFT & 1{,}999{,}000 & 250{,}469 & n/a & n/a\\
 \bottomrule
 \end{tabular}
+\vspace{2pt}
+
+{\raggedright\footnotesize The no-sketch row is the same protocol with
+observability off; its leader ingress equals HotStuff-2's two vote
+phases. n/r: not run.\par}
 \end{table}
 
 \begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{fig7_scaling.png}
-\caption{Message (left) and bandwidth (right) scaling, log-log. Proxima
-leads on messages throughout; on bandwidth the kilobyte digests cost a
-premium at small $N$ that inverts beyond $N \approx 2000$ as
-$\Theta(N^{2}/8)$ certificate bitmaps overtake $\Theta(N)$ digests.}
+\caption{Messages (left), bytes with threshold certificates (center), and
+bytes arriving at the leader (right) per block, log-log.}
 \label{fig:scaling}
 \end{figure*}
 
-\subsection{Fork Localization and Partition Healing}
+\subsection{Fork localization and healing}
 
-Fig.~\ref{fig:forkheal} measures the accumulator machinery: fork
-localization uses exactly $\log_{2} H + 1$ probes from $H = 64$ to
-$H = 4096$ (7 to 13 probes, each one 2\,KB accumulator), with every probe
-also reporting how much diverged; partition healing at 600-transaction
-state recovers the exact union at sketch-plus-push cost tracking the
-200-bytes-per-divergent-transaction floor, with the pre-repair estimate
-$\hat{d}$ within its predicted error of the true divergence throughout.
+Fig.~\ref{fig:forkheal}: fork localization used 7, 9, 11, and 13 probes
+at heights 64 to 4096, one 4\,KB ledger digest each. Partition healing
+over 600 transactions recovered the union at every divergence from 2 to
+128, with the pre-repair estimate within its predicted error (128.9 at
+$d = 128$) and total cost near 230 bytes per divergent transaction,
+including the second round in which the requester fetches the items it
+lacked.
 
 \begin{figure*}[t]
 \centering
 \includegraphics[width=\textwidth]{fig8_fork_heal.png}
-\caption{Left: fork-localization probes against chain height, matching
-$\log_{2} H + 1$ exactly. Right: partition-healing bytes against
-divergence, tracking the per-transaction push floor.}
+\caption{Left: fork-localization probes against chain height. Right:
+partition-healing bytes against divergence.}
 \label{fig:forkheal}
 \end{figure*}
 
-\subsection{What the Simulation Does Not Show}
+%============================================================================
+\section{Corrections to the Earlier Version}
+\label{sec:errata}
 
-Three honest limits bound these results. The Kauri numbers are a
-message-count model that credits neither pipelining, Kauri's central
-contribution to throughput, nor charges reconfiguration under relay
-failure; a faithful comparison needs Kauri's own harness. Latency is not
-reported at all: our earlier projections mixed measured constants with
-modeled round trips, and we now regard a multi-region deployment as the
-only honest source of latency claims (Section~\ref{sec:limits}). And
-$p_{\mathrm{miss}} = 0.37$ remains an internal measurement; the sensing
-results deliberately sweep it as a free parameter rather than defending
-the point value.
+For readers of~\cite{mercier2026proxima} and of our earlier drafts:
+\begin{enumerate}
+\item The one-round fast path at $2N/3$ signatures is unsafe across view
+changes (Section~\ref{sec:consensus}, Table~\ref{tab:fuzz}). The safe
+quorum is $\lceil (n + 3f + 1)/2 \rceil$ with vote histories in
+\textsc{new-view}.
+\item The liveness bound $\exp(-2N(1/3 - p)^{2})$ ignores Byzantine
+abstainers and is wrong near $f = N/3$ (Section~\ref{sec:consensus}).
+\item Message counts $2\times$ below HotStuff did not deliver
+certificates to all validators, charged different retransmission costs,
+and omitted chained HotStuff; under a shared model there is no message
+advantage over HotStuff-2 (Section~\ref{sec:eval}).
+\item The aggregator-chosen and, in our drafts, median references give
+the aggregator discretion; inside consensus the reference is $D(B)$.
+\item Tree leaves placed Byzantine validators last, so no leaf leader
+was ever Byzantine; with random placement leaves need a fallback path.
+\item Binding of the $\pm 1$ accumulator cannot rest on the modulus
+(Proposition~\ref{prop:inert}); the ledger now binds with LtHash.
+\item Deflation is not bounded by constant factors
+(Proposition~\ref{prop:deflate}).
+\end{enumerate}
 
 %============================================================================
 \section{Limitations and Future Work}
 \label{sec:limits}
 
-\textbf{Concrete cryptanalysis.} Binding rests on a reduction shape to a
-$\pm 1$-matrix SIS instance plus first-cut Wagner and lattice estimates
-and the inherited LtHash analysis; a dedicated cryptanalysis at exactly
-our parameters ($n = 512$, $q \in \{2^{16}, 2^{32}\}$, block-bounded
-weight) is open, and until it exists we claim no numeric security level.
+\textbf{No network measurements.} All results are counts from a
+simulator; latency, throughput, and the real distribution of
+$p_{\mathrm{miss}}$ need a multi-region deployment.
 
-\textbf{Deployment.} All numbers are simulation; a 50-to-200 node
-deployment across three regions would convert message counts into
-latency and throughput measurements and let us measure
-$p_{\mathrm{miss}}$ rather than assume it.
+\textbf{Proofs.} Theorem~\ref{thm:safety} is a proof sketch backed by
+fuzzing of single-slot agreement; a mechanized proof (TLA+ or Ivy) and a
+multi-slot, pipelined variant are open.
 
-\textbf{Adaptive adversaries.} The model is static corruption. An
-adversary who corrupts after observing tree assignments or sensing
-behavior requires VRF-based assignment with epoch rotation, described but
-not evaluated here; note that Theorem~\ref{thm:compose} is indifferent to
-this choice, since it holds against whatever adversary class $\Pi$
-tolerates.
+\textbf{Robust estimation.} Commit-then-salt restores unbiasedness
+against chosen sets; integrating it into gossip without an extra round,
+and Byzantine-robust push-sum over 512-dimensional sketches, are open.
 
-\textbf{Tree fast path.} Carrying speculative commitments up the tree
-requires per-group signer bitmaps; the flat fast path does not extend
-without them.
-
-\textbf{Value semantics.} Conservation verifies multiset settlement, not
-execution ordering; composing the invariant with an execution layer that
-needs atomicity across more than two shards is future work.
+\textbf{Applications.} The most promising use we see outside this paper
+is censorship monitoring for Ethereum inclusion lists~\cite{eip7805}:
+committee members publish sketches of the transactions they consider
+eligible, the median estimates how many a block omitted, and full lists
+are sent only when that estimate trips. Mempool divergence already causes
+false censorship accusations~\cite{albrecht2026mempool}; sketches
+measure it. Replica-consistency checks that report divergence size, and
+relay completeness scoring for gossip networks, are similar.
 
 %============================================================================
 \section{Conclusion}
 \label{sec:conclusion}
 
-Collision-resistant hashing gives consensus protocols a one-bit view of
-agreement, and the costs of that single bit run through the BFT
-literature: mandatory synchronization, unmeasurable agreement, oversized
-committees, per-transaction cross-shard coordination. The repair is not a
-better hash but a division of labor that we prove is forced: estimation
-objects cannot bind and binding objects cannot estimate, yet one
-zero-mean additive multiset hash provides both faces, an unbiased
-symmetric-difference estimator on its geometry and a SIS-hard homomorphic
-accumulator on its equality. Around that object we rebuilt a BFT protocol
-in which every optimistic mechanism fires on honest-sufficient conditions
-and every estimate is repaired by an exact decoder, and we extended the
-same algebra to sharded settlement as a conservation law with logarithmic
-fraud localization. The composition theorem guarantees all of it costs
-nothing in safety; the measurements say it pays in messages, in
-robustness to griefing and reference manipulation, and, at scale, in
-bandwidth.
+A hash tells a consensus protocol whether views differ; a sketch tells it
+roughly how much, and an adversary who knows the salt can make that
+estimate say almost anything. Taking both facts seriously gives a narrow,
+useful role for measurement in BFT: deciding when to try a fast path,
+whom to synchronize, and where a partition or a broken shard corridor
+is, with every decision failing soft and every safety property resting
+on signatures and on an LtHash accumulator. Building that role carefully
+exposed an unsafe fast path, a wrong liveness bound, an inert modulus,
+and an evaluation that flattered our earlier work; the corrected system
+costs more bytes than HotStuff-2 and is worth it only where its
+observability is.
 
 \bibliographystyle{IEEEtran}
 \bibliography{references}

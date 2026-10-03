@@ -1,5 +1,15 @@
 # Proxima v2: Work Plan
 
+> **Status (October 2026).** Workstreams A-E are implemented, and an audit
+> reshaped the paper: binding moved to LtHash, the fast path moved onto a
+> base protocol with view change (`bft.py`) at the FaB/SBFT quorum, the
+> evaluation now uses one shared cost model (no message advantage over
+> HotStuff-2), and the thesis is observability rather than efficiency.
+> See the header of `v2_formal_foundations.md` and Section "Corrections to
+> the Earlier Version" of the paper. Still open: testbed (E5), mechanized
+> proofs, Byzantine-robust gossip, and the censorship-monitoring
+> application.
+
 Companion to `docs/v2_formal_foundations.md` (the technical content) and the
 reviewer critique that motivated it. This file is the *plan*: what to build,
 in what order, with dependencies, effort, risks, and the decisions that shape
@@ -109,7 +119,7 @@ New module `dpmh.py`, replacing the `tx_to_vector` / `compute_vector` /
   commit predicate is "2N/3 signatures on H(B)" plus an estimation layer that
   gates only scheduling/sync/reporting inherits safety verbatim (simulate the
   estimation layer internally; commit messages identical). The v1 fast-path
-  correction is the corollary — **already implemented in the camera-ready**,
+  correction is the corollary, **already implemented in the camera-ready**,
   so this is writeup, not code. Depends B5.
 - **B7 [M]** Conservation soundness theorem + O(f log S) localization
   correctness (bisection over a linear invariant is exact). Depends D.
@@ -131,7 +141,7 @@ Extend `vector_consensus` / `tree_consensus` in `blockchain.py`.
   Phase 1 digests. Import Krum / Yin et al. Feeds E3, B (robustness note).
 - **C3 [L]** Two-syndrome reconciliation: **replace the bloom filter
   everywhere** (Phase 1 sync, cross-shard resolution, fork healing) with
-  estimate-then-decode — DPMH d_hat sizes the divergence, then minisketch at
+  estimate-then-decode, DPMH d_hat sizes the divergence, then minisketch at
   capacity ~d_hat (or rateless IBLT when d_hat is unreliable) recovers the
   exact differing transactions. Deletes the bloom false-positive analysis
   (old VIII-E) and the "bloom FP → exclusion" liveness chain. Needs a
@@ -154,7 +164,7 @@ it can spin out per D1.
   checks the global invariant Σ O_i = Σ I_j per block, O(S) signed ~KB
   objects. Compare against **batched** 2PC and **batched** receipts on
   per-block verification metadata and failure-path cost (not raw counts vs
-  unbatched 2PC — that comparison will get flagged).
+  unbatched 2PC, that comparison will get flagged).
 - **D2x [M]** Group-testing localization: beacon bisects the edge set on
   invariant failure, O(f log S) signed digest requests, then the implicated
   pair runs C3 reconciliation. Correctness is B7.
@@ -219,14 +229,14 @@ baselines in `hotstuff.py`.
 ### F. Related work + positioning
 
 - **F1 [M]** Literature pass and citation of: Clarke et al. (ASIACRYPT 2003,
-  incremental multiset hashes — the construction family), Bellare-Micciancio
-  (AdHash), Wagner (k-tree), LtHash (Lewi et al. 2019 — closest construction),
-  Alon-Matias-Szegedy (AMS/Tug-of-War — the estimator), Hardt-Woodruff (STOC
-  2013 — non-robustness), Minsky-Trachtenberg-Zippel + minisketch/Erlay
+  incremental multiset hashes, the construction family), Bellare-Micciancio
+  (AdHash), Wagner (k-tree), LtHash (Lewi et al. 2019, closest construction),
+  Alon-Matias-Szegedy (AMS/Tug-of-War, the estimator), Hardt-Woodruff (STOC
+  2013, non-robustness), Minsky-Trachtenberg-Zippel + minisketch/Erlay
   (Naumenko et al. 2019) + Graphene (Ozisik et al. 2019) + rateless IBLT
-  (Yang et al. SIGCOMM 2024) — the decoding side, Goodrich-Mitzenmacher IBLT,
-  Blanchard et al. Krum + Yin et al. — robust aggregation, Zyzzyva / SBFT /
-  HotStuff-2 — speculative + modern baseline. Also sweep CRDT anti-entropy /
+  (Yang et al. SIGCOMM 2024), the decoding side, Goodrich-Mitzenmacher IBLT,
+  Blanchard et al. Krum + Yin et al., robust aggregation, Zyzzyva / SBFT /
+  HotStuff-2, speculative + modern baseline. Also sweep CRDT anti-entropy /
   Dynamo Merkle-repair and "homomorphic fingerprinting."
 - **F2 [S]** Verify the precise novelty claim is unclaimed before writing "to
   our knowledge new": the specific target is *an L2 distance guarantee stated
@@ -257,7 +267,7 @@ The critique's order of operations, expanded:
 
 1. **A1-A4** (Rademacher core + test vectors). Everything downstream needs it.
 2. **B1-B3, E1-E2** (estimator theory + reran Fig 1 + threshold figure). This
-   is the quickest visible win — figures get *cleaner*, and the substitution
+   is the quickest visible win, figures get *cleaner*, and the substitution
    blind spot closes. Do this early to de-risk the central claim.
 3. **C1, E4** (readiness sensing + fast-path figure). The speculative fast
    path is already implemented; this adds the sensing knob and the
@@ -310,7 +320,7 @@ AFT/FC-tier paper: add 6, 9, and B4-with-a-cryptographer.
   Theorem 1. Implemented in `blockchain.py` and described in the paper. This
   is the Workstream-B6 corollary and the single highest-leverage fix from the
   critique.
-- Honest-sufficient trigger rule (count signatures, not variance) — closes the
+- Honest-sufficient trigger rule (count signatures, not variance), closes the
   one-Byzantine griefing vector by construction.
 - Zyzzyva + SBFT cited (speculative lineage).
 - A future-work sentence in the paper points at the three v2 directions
