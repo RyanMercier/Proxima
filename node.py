@@ -333,7 +333,7 @@ def main():
     all_v, honest, byzantine = make_validators(
         args.honest, args.byzantine, args.byzantine_strategy
     )
-    chain = Blockchain(all_v)
+    chain = Blockchain(all_v, clock=time.time)
 
     # Pre-fund accounts
     for name in args.init_accounts:

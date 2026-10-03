@@ -1,5 +1,14 @@
 #!/usr/bin/env python3
-"""Test each Byzantine strategy with 20 txs to verify exclusion behavior."""
+"""Byzantine strategy checks for the flat protocol (assertions, not prints).
+
+Each strategy runs with 20 txs and no partial observation so the Byzantine
+effect is isolated. Large-deviation strategies must be excluded by the
+distance filter; small-deviation ones may sit inside the cluster, which is
+harmless because finality needs valid signatures on the proposal's hash.
+Run: python test_byzantine.py
+"""
+
+import numpy as np
 
 import blockchain
 blockchain.USE_REAL_BLS = False
@@ -9,75 +18,43 @@ from blockchain import (
     vector_consensus,
 )
 
-strategies = ["drop_half", "random_vector", "replace_one_tx", "mimic_honest", "coalition"]
-n_txs = 20
-n_honest = 4
-n_byz = 1
+np.random.seed(11)
 
-for strategy in strategies:
+EXCLUDED = {"drop_half", "random_vector", "coalition"}
+MAY_STAY = {"replace_one_tx", "mimic_honest"}
+FAILS = 0
+
+
+def run(strategy, n_txs=20, n_honest=4, n_byz=1):
     BLSKeyPair._counter = 1
-    all_v, honest, byz = make_validators(n_honest, n_byz, strategy)
+    all_v, honest, _byz = make_validators(n_honest, n_byz, strategy)
     chain = Blockchain(all_v)
     for i in range(5):
         chain.register_account(f"A{i}", 100_000.0)
     for i in range(n_txs):
-        tx = chain.make_tx(f"A{i % 5}", f"A{(i+1) % 5}", 1.0)
+        tx = chain.make_tx(f"A{i % 5}", f"A{(i + 1) % 5}", 1.0)
         if tx:
             chain.submit_tx(tx)
-
     block = chain.propose_block(honest[0])
-    threshold = calibrate_threshold(block.tx_data_strings)
+    return vector_consensus(all_v, block, calibrate_threshold(), partial_obs={})
 
-    # No partial observation so we isolate the Byzantine effect
-    result = vector_consensus(all_v, block, threshold, partial_obs={})
 
-    sep = "=" * 60
-    print(f"\n{sep}")
-    print(f"Strategy: {strategy}")
-    print(f"Threshold: {threshold:.2f}")
-    print(f"Fast path: {result['fast_path']}")
-    print(f"Cluster size: {result['cluster_size']}")
+def expect(name, cond, detail=""):
+    global FAILS
+    print(f"  {'ok  ' if cond else 'FAIL'} {name} {detail}")
+    FAILS += 0 if cond else 1
 
-    for name, is_byz, strat, dist in result.get("excluded", []):
-        tag = "BYZANTINE" if is_byz else "honest"
-        print(f"  EXCLUDED: {name} ({tag}, {strat}) distance={dist:.2f}")
 
-    if not result.get("excluded"):
-        for v in all_v:
-            if v.is_byzantine:
-                d = result["distances"][v.name]
-                print(f"  IN CLUSTER: {v.name} (BYZANTINE, {v.strategy}) distance={d:.2f}")
+for strategy in sorted(EXCLUDED | MAY_STAY):
+    r = run(strategy)
+    excluded_byz = [e for e in r["excluded"] if e[1]]
+    excluded_honest = [e for e in r["excluded"] if not e[1]]
+    expect(f"{strategy}: finalizes", r["finalized"])
+    expect(f"{strategy}: no honest validator excluded", not excluded_honest,
+           str(excluded_honest))
+    if strategy in EXCLUDED:
+        expect(f"{strategy}: Byzantine excluded", len(excluded_byz) == 1,
+               str(r["distances"]))
 
-    print(f"Finalized: {result['finalized']}")
-    print(f"Messages: {result['msgs']} | Bandwidth: {result['msg_bytes']/1024:.1f} KB")
-
-# Also test with small block (3 txs) to show the threshold problem
-print(f"\n{'=' * 60}")
-print("SMALL BLOCK TEST (3 txs) -- drop_half")
-print("This shows why you need 10+ txs for clear Byzantine exclusion")
-print("=" * 60)
-
-BLSKeyPair._counter = 1
-all_v, honest, byz = make_validators(4, 1, "drop_half")
-chain = Blockchain(all_v)
-chain.register_account("Alice", 100_000.0)
-chain.register_account("Bob", 100_000.0)
-
-for i in range(2):
-    tx = chain.make_tx("Alice", "Bob", 10.0)
-    if tx:
-        chain.submit_tx(tx)
-
-block = chain.propose_block(honest[0])
-threshold = calibrate_threshold(block.tx_data_strings)
-result = vector_consensus(all_v, block, threshold, partial_obs={})
-
-print(f"Threshold: {threshold:.2f}")
-print(f"Cluster size: {result['cluster_size']}")
-for v in all_v:
-    if v.is_byzantine:
-        d = result["distances"][v.name]
-        status = "EXCLUDED" if d >= threshold else "IN CLUSTER"
-        print(f"  {status}: {v.name} distance={d:.2f} (threshold={threshold:.2f})")
-print(f"With only 3 txs (2 user + coinbase), dropping 1 keeps the Byzantine close enough.")
-print(f"Use --interval 10 and submit 10+ txs before the first block for a clear demo.")
+print(f"\n{'all passed' if not FAILS else f'{FAILS} failed'}")
+raise SystemExit(1 if FAILS else 0)

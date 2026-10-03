@@ -1,0 +1,24 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite the paper below."
+title: "Proxima: Distance-Preserving Digests for BFT Consensus"
+authors:
+  - family-names: Mercier
+    given-names: Ryan
+    affiliation: University of Connecticut
+license: MIT
+repository-code: "https://github.com/RyanMercier/Proxima"
+preferred-citation:
+  type: conference-paper
+  title: "Distance-Preserving Digests: A Primitive for BFT Consensus"
+  authors:
+    - family-names: Mercier
+      given-names: Ryan
+      affiliation: University of Connecticut
+  collection-title: "8th International Congress on Blockchain and Applications (BLOCKCHAIN)"
+  publisher:
+    name: Springer LNNS
+  year: 2026
+  identifiers:
+    - type: other
+      value: "arXiv:2605.15329"
+  url: "https://arxiv.org/abs/2605.15329"

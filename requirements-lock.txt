@@ -1,0 +1,6 @@
+# Exact versions used to produce paper_v2/results.json (Python 3.14.2).
+py-ecc==8.0.0
+bitarray==3.8.0
+matplotlib==3.10.8
+numpy==2.4.1
+flask==3.1.3

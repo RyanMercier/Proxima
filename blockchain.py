@@ -867,8 +867,13 @@ def block_reward(height: int) -> float:
 # ---------------------------------------------------------------------------
 
 class Blockchain:
-    def __init__(self, validators: list):
+    def __init__(self, validators: list, clock=None):
+        """clock: callable returning a timestamp for txs and blocks. The
+        default is a logical counter so every hash, digest, and result is
+        reproducible run to run; the live node passes time.time."""
         self.validators = validators
+        self._ticks = 0
+        self.clock = clock or self._logical_clock
         self.state = State()
         self.chain: List[Block] = []
         self.mempool: List[Transaction] = []
@@ -876,6 +881,10 @@ class Blockchain:
         # v2: cumulative ledger-domain accumulator, P[b] per block height.
         # Enables O(1) range digests and O(log H) fork localization.
         self.ledger_acc = dpmh.Accumulator()
+
+    def _logical_clock(self) -> float:
+        self._ticks += 1
+        return float(self._ticks)
 
     @property
     def height(self) -> int:
@@ -907,7 +916,7 @@ class Blockchain:
             amount=amount,
             nonce=self.state.nonce(s_addr) + pending_nonce,
             fee=fee,
-            timestamp=time.time(),
+            timestamp=self.clock(),
             sender_name=sender_name,
             receiver_name=receiver_name,
         )
@@ -924,7 +933,7 @@ class Blockchain:
                         receiver_name=proposer.name)
         cb.compute_hash()
         txs = [cb] + list(self.mempool)
-        return Block(self.height, self.tip, txs, time.time(), addr,
+        return Block(self.height, self.tip, txs, self.clock(), addr,
                      proposer_name=proposer.name)
 
     def finalize_block(self, block: Block) -> bool:
