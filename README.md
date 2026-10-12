@@ -1,6 +1,6 @@
 # Proxima: Distance-Preserving Digests for BFT Consensus
 
-MEng capstone project, University of Connecticut. Advisor: Dr. Joe Johnson.
+MEng capstone project, University of Connecticut. Advisor: Dr. Joe Johnson
 
 Every BFT consensus protocol uses collision-resistant hashes to compare validator state. Collision resistance destroys distance: validators agreeing on 19 of 20 transactions produce unrelated hashes, indistinguishable from validators sharing nothing. This forces three constraints across the BFT literature: validators must synchronize state before voting, agreement quality cannot be measured until votes are counted, and hierarchical committees must be large enough for independent BFT.
 
